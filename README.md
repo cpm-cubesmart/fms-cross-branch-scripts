@@ -1,4 +1,9 @@
-# USAGE for settings.rb script
+# Scripts
+
+This repository has scripts that allow you to test behavior between two branches
+of a rubyonrails application. Some are specific to CubeSmart's FMS application.
+
+## USAGE for settings.rb script
 
 For this example, I'm assuming the following:
 - You have `main` checked out at /home/developer/code/fms
@@ -31,3 +36,7 @@ If your paths are different, please adjust the commands accordingly.
 
         cd ~/fms-cross-branch-scripts
         diff -u output_main_settings.txt output_zeitwerk_settings.txt > output_settings.diff
+
+## USAGE for rails-eager-load-snapshot
+
+TODO
