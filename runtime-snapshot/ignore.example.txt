@@ -1,0 +1,51 @@
+# Allowlist of triaged differences.
+#
+# Copy to runtime-snapshot/snapshots/ignore.txt and bin/compare will pick it up
+# automatically. Everything listed here is subtracted from the counts, so the
+# header keeps shrinking as you work instead of stalling on things you have
+# already decided are fine.
+#
+# Record WHY next to each entry. Six weeks from now the entry is the only thing
+# left explaining the decision.
+#
+# Format: one rule per line, "<kind> <pattern>". Patterns are globs
+# (File.fnmatch), # starts a comment.
+#
+#   constant <glob>   ignore a constant entirely -- its ancestors, methods,
+#                     source and reopen order all stop being reported
+#   ancestor <glob>   ignore one module wherever it appears *inside* an ancestor
+#                     chain; constant matches the chain owner, this matches a
+#                     chain member. Globs cross "::".
+#   file     <glob>   ignore a file in the load-set and load-order sections
+#   method   <glob>   ignore one method; Foo#bar is an instance method,
+#                     Foo.bar is a singleton method
+#   section  <id>     ignore a whole section; ids are the keys printed in the
+#                     counts header (constants_missing, ancestor_diffs,
+#                     load_order_moves, line_only_changes, ...)
+
+# ---------------------------------------------------------------------------
+# Examples -- delete these and add your own.
+# ---------------------------------------------------------------------------
+
+# Generated at boot from the schema, so it differs whenever the DB does.
+# constant *::GeneratedAttributeMethods
+
+# Test-only support classes that the zeitwerk branch deliberately stopped
+# eager loading (2026-08-04, confirmed with the team).
+# constant Testing::*
+
+# Anything prepended to Object lands in every ancestor chain, so one global
+# difference gets re-reported once per constant. ZeitwerkIntegration's own shims
+# are collapsed already (--include-zeitwerk-shims keeps them); this is the shape
+# of the rule for the next one.
+# ancestor ActiveSupport::ForkTracker::*
+
+# Line numbers move whenever any file is touched; not useful during the
+# migration itself.
+# section line_only_changes
+
+# Vendored code we are not migrating.
+# file vendor/**
+
+# Deliberately reimplemented on the zeitwerk branch.
+# method LegacyReport#to_csv

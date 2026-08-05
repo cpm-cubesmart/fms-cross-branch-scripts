@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+#
+# Build the old -> new path map between the base branch and the Zeitwerk branch.
+#
+#   bin/renames <zeitwerk-app-dir> [base-ref]
+#
+# Example:
+#   runtime-snapshot/bin/renames ~/code/fms-worktrees/zeitwerk_upgrade_low_impact main
+#
+# Run this from the Zeitwerk checkout (that is where HEAD has the renames), and
+# re-run it whenever you move more files on that branch -- a stale map shows
+# renamed files as removed-here-added-there throughout the report.
+
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$HERE/../script"
+SNAPSHOT_DIR="${SNAPSHOT_DIR:-$HERE/../snapshots}"
+
+if [ $# -lt 1 ]; then
+  echo "Usage: $(basename "$0") <zeitwerk-app-dir> [base-ref]   (base-ref defaults to main)" >&2
+  exit 2
+fi
+
+APP_DIR="$(cd "$1" && pwd)"
+BASE="${2:-main}"
+
+mkdir -p "$SNAPSHOT_DIR"
+OUT="$SNAPSHOT_DIR/renames.json"
+
+cd "$APP_DIR"
+ruby "$SCRIPT_DIR/dump_git_renames.rb" "$BASE" HEAD > "$OUT"
+
+echo "wrote $OUT ($(ruby -rjson -e 'puts JSON.parse(File.read(ARGV[0]))["rename_count"]' "$OUT") renames, $BASE..HEAD)"

@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+#
+# Capture a runtime snapshot of a Rails checkout.
+#
+#   bin/snapshot <app-dir> <label>
+#
+# Example:
+#   runtime-snapshot/bin/snapshot ~/code/fms main-eager
+#
+# The snapshot lands in runtime-snapshot/snapshots/<label>.json, with method
+# source bodies alongside it in <label>.sources.json.
+#
+# config.eager_load is NOT set by this script -- it is read from whatever
+# config/environments/<env>.rb says, and echoed below so a forgotten edit is
+# caught before you spend time reading a diff that was never comparable.
+
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$HERE/../script"
+SNAPSHOT_DIR="${SNAPSHOT_DIR:-$HERE/../snapshots}"
+
+if [ $# -lt 2 ]; then
+  cat >&2 <<USAGE
+Usage: $(basename "$0") <app-dir> <label>
+
+  <app-dir>  path to a Rails checkout (e.g. ~/code/fms)
+  <label>    name for this snapshot (e.g. main-eager, zeitwerk-noeager)
+
+Environment:
+  RAILS_ENV                 defaults to development
+  SNAPSHOT_DIR              output directory (default runtime-snapshot/snapshots)
+  SNAPSHOT_SOURCE_TEXT=0    skip capturing method source bodies
+  SNAPSHOT_TRACE_COMPILE=1  also record :script_compiled events (needs a cold
+                            Bootsnap cache to mean anything)
+  SNAPSHOT_TRACE_ALL=1      trace class bodies outside the app root too
+USAGE
+  exit 2
+fi
+
+APP_DIR="$(cd "$1" && pwd)"
+LABEL="$2"
+
+if [ ! -f "$APP_DIR/config/environment.rb" ]; then
+  echo "error: $APP_DIR does not look like a Rails application (no config/environment.rb)" >&2
+  exit 2
+fi
+
+mkdir -p "$SNAPSHOT_DIR"
+OUT="$SNAPSHOT_DIR/$LABEL.json"
+
+RAILS_ENV="${RAILS_ENV:-development}"
+ENV_FILE="$APP_DIR/config/environments/$RAILS_ENV.rb"
+
+echo "=== snapshot: $LABEL ==="
+echo "  app:    $APP_DIR"
+echo "  branch: $(git -C "$APP_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '(not a git repo)')"
+echo "  env:    $RAILS_ENV"
+
+# Read the configured value straight out of the environment file. This is a
+# textual check, so it can be wrong for anything computed at runtime -- the
+# authoritative value is recorded inside the snapshot by the dumper, and the
+# comparator refuses to diff a mismatched pair. This is just an early warning.
+if [ -f "$ENV_FILE" ]; then
+  EAGER_LINE="$(grep -E '^\s*config\.eager_load\s*=' "$ENV_FILE" | tail -1 | sed 's/^[[:space:]]*//' || true)"
+  echo "  eager:  ${EAGER_LINE:-(config.eager_load not set literally in $RAILS_ENV.rb)}"
+else
+  echo "  eager:  ($ENV_FILE not found)"
+fi
+echo
+
+cd "$APP_DIR"
+
+# DISABLE_SPRING is essential: Spring forks a pre-booted server process, so the
+# boot this script is trying to observe would have happened in some other
+# process, before RUBYOPT ever took effect.
+DISABLE_SPRING=1 \
+DISABLE_SPRING_BOOT=1 \
+RAILS_ENV="$RAILS_ENV" \
+SNAPSHOT_LABEL="$LABEL" \
+SNAPSHOT_OUT="$OUT" \
+RUBYOPT="${RUBYOPT:-} -r$SCRIPT_DIR/preboot_trace.rb" \
+  bin/rails runner "$SCRIPT_DIR/dump_runtime_snapshot.rb"
+
+echo
+echo "wrote $OUT"
