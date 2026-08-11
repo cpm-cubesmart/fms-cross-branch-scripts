@@ -24,6 +24,7 @@ For what the tool is and how it works internally, see the repository
 11. [Running without the wrappers](#11-running-without-the-wrappers)
 12. [Troubleshooting](#12-troubleshooting)
 13. [Output files](#13-output-files)
+14. [Finding re-entrant loads](#14-finding-re-entrant-loads)
 
 ---
 
@@ -88,7 +89,7 @@ cd ~/code/fms-cross-branch-scripts
 runtime-snapshot/test/selftest.sh
 ```
 
-Expected: `85 passed, 0 failed`.
+Expected: `101 passed, 0 failed`.
 
 It builds two throwaway applications in a temp directory and runs the real
 dumper and comparator over them. No Rails, no database, no network, nothing
@@ -296,7 +297,7 @@ semantic finding happened, not to be driven to zero.
 | `association_changes` | An association arrived, vanished, or changed macro/options. **Invisible to every other section** — the reader methods live in `GeneratedAssociationMethods`, which is collapsed as a timing artifact, and a reflection is not a constant, an owned method or an ancestor. A lost `has_many` silently changes what queries return and what STI code sees. |
 | `class_attribute_changes` | An entry **arrived or vanished** from what an `included do ... end` block did: `__callbacks`, `_validators`, `default_scopes`, `_process_action_callbacks`. These leave the ancestor chain and the method list untouched, so **no other section can see one stop happening** — a callback that is no longer registered, a validation no longer declared, a `default_scope` composed in a different order. | Something that reaches into the class from outside it stopped running, or ran against a different set of classes. An initializer iterating `descendants` is the usual cause: classic's explicit requires had loaded them, Zeitwerk has not. |
 | `resolution_order_changes` → note | Only rows where the **winning** definition changed, or the method is no longer defined at all. |
-| `constant_value_changes` | A constant's value differs. Only simple values are compared; anything else records its kind and is never reported. | Load order changed which assignment ran last. |
+| `constant_value_changes` | A constant's value differs. Only simple values are compared; anything else records its kind and is never reported. Hash pairs are digested **sorted**, so a hash that merely reordered lands in `constant_value_order_only` instead. Note the markers: `~` means the values were compared and differ, while `-` and `+` mean one side has no record of the constant **at all** — a different finding, and usually a load-order or scope question rather than a value question. | Load order changed which assignment ran last. |
 | `resolution_order_changes` | For one method name, the ancestors defining it changed — which one wins, what `super` walks, or whether it is defined at all. **The monkey-patch section.** | A concern that stopped being included, or a `prepend` landing on the wrong side. |
 | `method_set_changes` | A class does not have the same methods on both branches: one is missing (`-`), one is extra (`+`), or one has the same name and a different body (`~`). Counted per class, because that is what you act on. Bodies are compared by the digest of their **compiled instruction sequence**, so comments, formatting, file moves and namespacing do not count — only a change in what the method actually does. That is also what makes dynamically defined accessors comparable at all; they have no usable source text. | A missing method usually means the file defining it is not loaded; an extra one is often the flip side of a reopen-order change, where a definition that used to be overwritten now survives; a changed body means the wrong definition is winning. |
 | `visibility_changes` | Public/protected/private changed for a method. | A `private` declaration landing in a different reopening. |
@@ -454,6 +455,7 @@ original definition. No error is raised. The method silently reverts.
 | --- | --- |
 | `class_attribute_order_only` | Same callbacks/validators, different order. `after_commit` runs in registration order so this *can* matter, but it is normally one module being included at a different point, and it is an order of magnitude more common than a real removal. |
 | `attribute_ownership_only` | A `class_attribute` reader stopped or started being defined on a class's own singleton, while the value it resolves to is **byte-identical** on both branches — an assignment that wrote back the inherited value creates ownership and nothing else. Suppressed from the semantic sections only when both sides captured a comparable value and the two are equal; any difference at all, or a missing capture, leaves the row in `class_attribute_changes` or `method_set_changes`. |
+| `constant_value_order_only` | A constant hash has the same keys and the same values in a different insertion order. Ruby preserves hash order, so `#each` and `#first` see it — but a constant hash built by iterating something that follows load order reorders for reasons unrelated to behaviour. One gem constant produced three different digests across four snapshots with identical contents, two of them from the same branch. |
 | `resolution_super_only` | The same definition still wins the call; only what `super` walks moved. Inert unless the winner calls `super`. |
 | `files_only_a` / `files_only_b` | A file was loaded on one branch only, judged by the union of `$LOADED_FEATURES`, the class-body trace, and classic's `Dependencies.history` — no single one of those is comparable across autoloaders. Worth scanning — a file in `files_only_a` often explains a `constants_missing` entry. |
 
@@ -691,3 +693,80 @@ ruby -rjson -e 'JSON.parse(File.read(ARGV[0]))["load_order"]["class_bodies"]
 ruby -rjson -e 'puts JSON.parse(File.read(ARGV[0]))["load_order"]["files"].first(40)' \
   runtime-snapshot/snapshots/main-eager.json
 ```
+
+---
+
+## 14. Finding re-entrant loads
+
+The comparator answers "do the two branches differ". This answers a question about
+**one** branch: was any file read while it was still being written?
+
+```bash
+runtime-snapshot/bin/cycles zeitwerk-eager
+runtime-snapshot/bin/cycles main-eager        # run both; the difference is what the migration introduced
+```
+
+### What it looks for
+
+A file that opened a class body before another file, and finished *after* it —
+ordinary parenthesis matching over two orderings the snapshot already records:
+
+| Source | Order | Available on |
+| --- | --- | --- |
+| `load_order.class_bodies` | **start** — when a class or module body opens | both branches |
+| `load_order.files` (`$LOADED_FEATURES`) | **completion** — CRuby appends after a file finishes evaluating | both, but classic's app files are absent (it uses `Kernel#load`) |
+| `load_order.autoloaded` (`Dependencies.history`) | **completion** — appended after `require_or_load` returns | classic only |
+
+Nesting on its own is not a finding: every autoload nests. It becomes one when a
+constant defined in the inner file takes an **ancestor** from the outer one — that
+constant saw whatever the outer file had defined at that instant, and nothing it
+defined afterwards.
+
+### Why it matters
+
+This is what cost `FacilitySettings` all 622 of its generated setting accessors:
+
+```ruby
+# defaultable/company_settings.rb, mid-body
+DEFAULTS = {}                       # assigned, not yet populated
+...something here reaches FacilitySettings...
+    # facility_settings.rb
+    include Defaultable::CompanySettings        # already in the constant table:
+                                                # no autoload, no wait
+    generate_default_setting_methods(DEFAULTS)  # iterates an empty hash
+```
+
+No exception, no missing constant, no failed boot — a macro read a half-built
+value and generated nothing. Load the two files in the other order and it works,
+which is exactly why a migration that changes load order is where this surfaces.
+Inheritance is the worse case of the two and is labelled separately: a subclass
+reads its superclass's macros, callbacks and class attributes at definition time.
+
+### Reading the output
+
+`Coverage` is printed every run, including runs that find nothing. A pair that
+could not be ranked looks identical to a pair that was ranked and found clean, so
+the counts are the only way to tell "no cycles" from "no data".
+
+| Line | Meaning |
+| --- | --- |
+| `ranked by $LOADED_FEATURES` | Files with a completion rank from the VM. On Zeitwerk this is everything. |
+| `ranked by Dependencies.history` | Classic's own record. `refused: sorted` means the snapshot predates script version 13, which stored it sorted — see below. |
+| `ancestor pairs tested` | Pairs where the ancestor's file opened first. The candidate set. |
+| `pairs skipped, no shared clock` | The two files' completion times came from different mechanisms, which cannot be compared. `config/initializers/*.rb` land here permanently: Rails `load`s them, so they never get a completion record at all. |
+
+### Limits
+
+- It cannot see a body that reads an incomplete constant **without** inheriting or
+  including anything from it. That is the literal mechanism above — the `include`
+  is a correlated signal, not the injury. Catching it needs enter/exit events on a
+  single clock, which means wrapping `Kernel#require` ahead of Bundler and Bootsnap.
+- A sorted `autoloaded` list is refused rather than ranked. Ranking against one
+  claimed 14,768 re-entrant pairs on this application, every one of them an
+  alphabetical accident. If you see the refusal, re-snapshot at version 13 or
+  later.
+
+| Option | Effect |
+| --- | --- |
+| `--json` | Findings and coverage as structured data. |
+| `--exit-code` | Exit 1 when any re-entrant load is found. |

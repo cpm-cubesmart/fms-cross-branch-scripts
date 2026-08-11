@@ -1255,6 +1255,214 @@ assert_eq "a class that raises from ancestors is still captured" \
   "$(ruby -rjson -e 'puts JSON.parse(File.read(ARGV[0]))["constants"].key?("Hostile")' "$WORK/snap/hostile.json")"
 
 echo
+echo "-- pending autoloads --"
+
+# Module#autoload? defaults to inherit = true, and a constant defined on the
+# receiver does NOT stop the ancestor walk. So a class defining its own SMS used
+# to be skipped because Object had a pending autoload for that name -- which is
+# how Lead::Kinds::SMS vanished from the non-eager Zeitwerk snapshot while being
+# defined three characters away in the same class body.
+mkdir -p "$WORK/autoload-guard/config" "$WORK/autoload-guard/app"
+
+cat > "$WORK/autoload-guard/app/never_loaded.rb" <<'RUBY'
+raise "the snapshot triggered a pending autoload"
+RUBY
+
+cat > "$WORK/autoload-guard/app/holder.rb" <<'RUBY'
+class Holder
+  # Same name as the pending top-level autoload registered below, and defined
+  # right here. This is the one that must survive.
+  SMS = "local"
+  # A genuinely pending autoload on this very module. This one must still be
+  # skipped -- reading it would load the file, which is the whole reason the
+  # guard exists.
+  autoload :Later, File.expand_path("never_loaded.rb", __dir__)
+end
+RUBY
+
+cat > "$WORK/autoload-guard/config/application.rb" <<'RUBY'
+Object.autoload(:SMS, File.expand_path("../app/never_loaded.rb", __dir__))
+require_relative "../app/holder"
+RUBY
+
+snapshot "$WORK/autoload-guard" autoload_guard > /dev/null
+
+value_of() { # snapshot constant name
+  ruby -rjson -e '
+    c = JSON.parse(File.read(ARGV[0]))["constants"][ARGV[1]]
+    v = c && (c["values"] || {})[ARGV[2]]
+    puts(v && v["sha"] ? "recorded" : "absent")
+  ' "$WORK/snap/$1.json" "$2" "$3"
+}
+
+assert_eq "a constant shadowed by a pending top-level autoload is still recorded" \
+  "recorded" "$(value_of autoload_guard Holder SMS)"
+
+assert_eq "a pending autoload on the module itself is still skipped" \
+  "absent" "$(value_of autoload_guard Holder Later)"
+
+echo
+echo "-- constant hash ordering --"
+
+# A constant hash built by iterating something that follows load order reorders
+# for reasons unrelated to behaviour. Net::SSH::Connection::Session::MAP produced
+# three digests across four snapshots with identical contents, two of them from
+# the same branch -- so hash pairs are digested sorted, and insertion order is
+# reported separately.
+for variant in same reordered changed; do
+  mkdir -p "$WORK/hash-$variant/config" "$WORK/hash-$variant/app"
+  echo 'require_relative "../app/hash_order"' > "$WORK/hash-$variant/config/application.rb"
+done
+
+cat > "$WORK/hash-same/app/hash_order.rb" <<'RUBY'
+module HashOrder
+  MAP = { alpha: 1, beta: 2 }
+end
+RUBY
+
+cat > "$WORK/hash-reordered/app/hash_order.rb" <<'RUBY'
+module HashOrder
+  MAP = { beta: 2, alpha: 1 }
+end
+RUBY
+
+cat > "$WORK/hash-changed/app/hash_order.rb" <<'RUBY'
+module HashOrder
+  MAP = { beta: 2, alpha: 99 }
+end
+RUBY
+
+snapshot "$WORK/hash-same"      hash_same      > /dev/null
+snapshot "$WORK/hash-reordered" hash_reordered > /dev/null
+snapshot "$WORK/hash-changed"   hash_changed   > /dev/null
+
+assert_eq "a hash that only reordered is not a value change" \
+  "0" "$(count hash_same hash_reordered constant_value_changes)"
+
+assert_eq "and it is reported as an ordering difference instead" \
+  "1" "$(count hash_same hash_reordered constant_value_order_only)"
+
+# The guard that matters: sorting the pairs must not be able to hide a real
+# difference. Same reordering as above, plus one changed value.
+assert_eq "a hash whose value changed is still a value change" \
+  "1" "$(count hash_same hash_changed constant_value_changes)"
+
+assert_eq "and it is not filed as ordering only" \
+  "0" "$(count hash_same hash_changed constant_value_order_only)"
+
+echo
+echo "-- re-entrant loads --"
+
+# The FacilitySettings failure: a file read while it was still being written.
+# Whichever of the two loads first decides whether the second sees a finished
+# definition or a half-built one, which is why changing load order surfaces it.
+mkdir -p "$WORK/reentrant/config" "$WORK/reentrant/app"
+
+cat > "$WORK/reentrant/app/mod_a.rb" <<'RUBY'
+module ModA
+  PARTIAL = {}
+  # Mid-body. ClassB loads, includes this module, and sees PARTIAL empty --
+  # everything below this line does not exist yet as far as ClassB is concerned.
+  require_relative "class_b"
+  PARTIAL[:filled] = true
+end
+RUBY
+
+cat > "$WORK/reentrant/app/class_b.rb" <<'RUBY'
+class ClassB
+  include ModA
+end
+RUBY
+
+cat > "$WORK/reentrant/app/base_a.rb" <<'RUBY'
+class BaseA
+  require_relative "child_b"
+end
+RUBY
+
+cat > "$WORK/reentrant/app/child_b.rb" <<'RUBY'
+class ChildB < BaseA
+end
+RUBY
+
+# The false-positive guard. An ordinary concern, included by an ordinary class,
+# with nothing re-entrant about it. If this ever shows up, the detector is
+# reporting nesting rather than re-entrancy and is worthless on a real app.
+cat > "$WORK/reentrant/app/clean_mod.rb" <<'RUBY'
+module CleanMod
+  FULLY = :built
+end
+RUBY
+
+cat > "$WORK/reentrant/app/clean_class.rb" <<'RUBY'
+require_relative "clean_mod"
+class CleanClass
+  include CleanMod
+end
+RUBY
+
+cat > "$WORK/reentrant/config/application.rb" <<'RUBY'
+require_relative "../app/mod_a"
+require_relative "../app/base_a"
+require_relative "../app/clean_class"
+RUBY
+
+snapshot "$WORK/reentrant" reentrant > /dev/null
+
+cycles() { ruby "$SCRIPT_DIR/find_load_cycles.rb" "$WORK/snap/$1.json" "${@:2}"; }
+
+cycles_json() { # label ruby-expression-over-parsed-json
+  cycles "$1" --json | ruby -rjson -e 'j = JSON.parse($stdin.read); puts (eval ARGV[0])' "$2"
+}
+
+assert_eq "a file read while still loading is reported" \
+  "2" "$(cycles_json reentrant 'j["findings"].length')"
+
+assert_eq "the module included mid-body is named, with its file" \
+  "app/mod_a.rb" \
+  "$(cycles_json reentrant 'j["findings"].find { |f| f["constant"] == "ClassB" }["in_flight_file"]')"
+
+assert_eq "and it is labelled as an include" \
+  "includes" \
+  "$(cycles_json reentrant 'j["findings"].find { |f| f["constant"] == "ClassB" }["relation"]')"
+
+# Worse than an include: a subclass reads its superclass's macros, callbacks and
+# class attributes at definition time, so a half-built superclass is silent.
+assert_eq "a superclass that was still loading is labelled as inheritance" \
+  "inherits" \
+  "$(cycles_json reentrant 'j["findings"].find { |f| f["constant"] == "ChildB" }["relation"]')"
+
+assert_eq "an ordinary include of a finished module is not reported" \
+  "0" "$(cycles_json reentrant 'j["findings"].count { |f| f["constant"] == "CleanClass" }')"
+
+assert_eq "both constants that read an incomplete file are named" \
+  "ChildB,ClassB" \
+  "$(cycles_json reentrant 'j["findings"].map { |f| f["constant"] }.sort.join(",")')"
+
+assert_eq "--exit-code returns 1 when a re-entrant load is found" \
+  "1" "$(cycles reentrant --exit-code > /dev/null 2>&1; echo $?)"
+
+# A sorted list is not a clock. autoloaded was stored sorted through script
+# version 12, and ranking against it claimed 14,768 re-entrant pairs on the real
+# application -- every one of them an alphabetical accident.
+ruby -rjson -e '
+  s = JSON.parse(File.read(ARGV[0]))
+  s["load_order"]["autoloaded"] = (1..200).map { |i| format("app/f%03d.rb", i) }
+  File.write(ARGV[1], JSON.generate(s))
+' "$WORK/snap/reentrant.json" "$WORK/snap/reentrant_sorted.json"
+
+assert_eq "a sorted autoloaded list is refused rather than ranked" \
+  "1" "$(cycles reentrant_sorted | grep -c 'sorted order')"
+
+assert_eq "and the refusal is visible in the coverage block" \
+  "1" "$(cycles reentrant_sorted | grep -c 'refused: sorted')"
+
+# Coverage is printed because a pair that could not be ranked looks exactly like
+# a pair that was ranked and found clean.
+assert_eq "coverage is reported even when nothing is found" \
+  "1" "$(cycles hash_same | grep -c '## Coverage')"
+
+echo
 if [ "$FAIL" -eq 0 ]; then
   printf '\033[32m%d passed, 0 failed\033[0m\n\n' "$PASS"
   exit 0

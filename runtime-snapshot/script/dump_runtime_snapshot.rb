@@ -111,7 +111,17 @@ end
 #    live in GeneratedAssociationMethods, which is excluded.
 # 12: load_order.autoloaded -- classic's own require_or_load record. $LOADED_FEATURES
 #    misses everything classic autoloads, because it uses Kernel#load.
-SCRIPT_VERSION = 12
+# 13: three fidelity fixes, all of which produced differences that were not real.
+#    (a) the pending-autoload guard asked Module#autoload? with inherit defaulting
+#        to true, so a class defining its own SMS was skipped because Object had a
+#        pending autoload for that name. Non-eager Zeitwerk snapshots only.
+#    (b) hash constants are digested from sorted pairs; insertion order moved to
+#        order_sha and is informational. One gem constant reported three digests
+#        across four snapshots with identical content.
+#    (c) load_order.autoloaded keeps insertion order, which is classic's file
+#        completion order. It was sorted, which made it useless for detecting a
+#        file that was read while still loading.
+SCRIPT_VERSION = 13
 
 OUT_PATH        = ENV["SNAPSHOT_OUT"]
 SOURCES_PATH    = ENV["SNAPSHOT_SOURCES_OUT"]
@@ -512,13 +522,67 @@ UM_CONSTANTS = Module.instance_method(:constants)
 UM_CONST_GET = Module.instance_method(:const_get)
 UM_AUTOLOAD_P = Module.instance_method(:autoload?)
 
+# Module#autoload? defaults to inherit = true, and -- unlike const_get -- a
+# constant defined on the receiver does NOT stop the ancestor walk. The lookup
+# only ends at a pending autoload entry or at the end of the chain, so a class
+# that defines its own SMS reports Object's pending autoload for SMS:
+#
+#   c = Class.new { const_set(:SMS, "sms") }
+#   Object.autoload(:SMS, "app/models/sms.rb")
+#   c.autoload?(:SMS)         # => "app/models/sms.rb"   <- not ours
+#   c.autoload?(:SMS, false)  # => nil
+#   c.const_get(:SMS, false)  # => "sms"
+#
+# That dropped Lead::Kinds::SMS and MoveInInstructionsSentTenantEvent::
+# DeliveryMethods::SMS from every non-eager Zeitwerk snapshot: app/models/sms.rb
+# defines a top-level SMS, which is a pending autoload until something loads it,
+# and both classes have Object in their ancestors. Under classic there is no Ruby
+# autoload to find, and under eager load everything is already resolved -- so the
+# guard and the getter disagreeing only shows up in one of the four snapshots.
+#
+# The second argument arrived in Ruby 2.7. Feature-detected rather than assumed,
+# because safe{} would swallow the ArgumentError on an older Ruby and leave the
+# guard silently passing every pending autoload through to const_get.
+AUTOLOAD_P_TAKES_INHERIT =
+  begin
+    Module.new.autoload?(:UnlikelyToExist, false)
+    true
+  rescue ArgumentError
+    false
+  end
+
+# True only when this module's own constant table holds a pending autoload for
+# the name. Paired with const_get(name, false) below: same module, same rule.
+def pending_autoload?(mod, const_name)
+  if AUTOLOAD_P_TAKES_INHERIT
+    safe { UM_AUTOLOAD_P.bind(mod).call(const_name, false) }
+  else
+    # No way to ask about this module alone. Skipping on an inherited hit is the
+    # safe direction -- it loses a constant, where the alternative risks firing
+    # the autoload this script exists not to fire.
+    safe { UM_AUTOLOAD_P.bind(mod).call(const_name) }
+  end
+end
+
 MAX_VALUE_DEPTH = 6
 MAX_VALUE_ITEMS = 500
 
 # Returns a canonical string, or nil when the value is not worth digesting.
-# Order-sensitive by design: if load order changes the order of a literal, that
-# is exactly the finding.
-def serialize_value(value, depth = 0)
+#
+# Array order is part of the value and is always kept. Hash order is not: it
+# survives in Ruby, but a constant hash built by iterating something whose order
+# follows load order reorders itself for reasons that have nothing to do with
+# what the application does. Net::SSH::Connection::Session::MAP produced three
+# different digests across four snapshots with identical keys and values -- and
+# two of those three were the same branch, so it did not even track the thing
+# being compared.
+#
+# So it is serialized twice: canonical: true sorts the pairs and feeds "sha",
+# which is what a difference is judged on; canonical: false keeps insertion
+# order and feeds "order_sha", which is recorded only when it differs and is
+# reported informationally. Sorting cannot hide a real change -- keys are unique,
+# so any changed key or value changes the sorted set too.
+def serialize_value(value, depth = 0, canonical: false)
   return nil if depth > MAX_VALUE_DEPTH
 
   case value
@@ -537,19 +601,22 @@ def serialize_value(value, depth = 0)
   when Array
     return nil if value.length > MAX_VALUE_ITEMS
 
-    parts = value.map { |v| serialize_value(v, depth + 1) }
+    parts = value.map { |v| serialize_value(v, depth + 1, canonical: canonical) }
     parts.any?(&:nil?) ? nil : "[#{parts.join(',')}]"
   when Hash
     return nil if value.length > MAX_VALUE_ITEMS
 
     parts = value.map do |k, v|
-      key = serialize_value(k, depth + 1)
-      val = serialize_value(v, depth + 1)
+      key = serialize_value(k, depth + 1, canonical: canonical)
+      val = serialize_value(v, depth + 1, canonical: canonical)
       key && val ? "#{key}=>#{val}" : nil
     end
-    parts.any?(&:nil?) ? nil : "{#{parts.join(',')}}"
+    return nil if parts.any?(&:nil?)
+
+    parts = parts.sort if canonical
+    "{#{parts.join(',')}}"
   when Set
-    parts = value.to_a.map { |v| serialize_value(v, depth + 1) }
+    parts = value.to_a.map { |v| serialize_value(v, depth + 1, canonical: canonical) }
     parts.any?(&:nil?) ? nil : "#<Set:[#{parts.sort.join(',')}]>"
   end
 end
@@ -734,16 +801,26 @@ def constant_values(mod)
     # of the non-eager pair is to measure what boot alone loaded. Ruby's own
     # autoload is visible here; Rails classic autoloading goes through
     # const_missing, so an unloaded constant is simply not listed at all.
-    next if safe { UM_AUTOLOAD_P.bind(mod).call(const_name) }
+    next if pending_autoload?(mod, const_name)
 
     value = safe { UM_CONST_GET.bind(mod).call(const_name, false) }
 
     # Modules and classes are captured as constants elsewhere.
     next if value.is_a?(Module)
 
-    serialized = safe { serialize_value(value) }
+    serialized = safe { serialize_value(value, canonical: true) }
     entry = { "kind" => safe { value_kind(value) } || "unknown" }
-    entry["sha"] = Digest::SHA256.hexdigest(serialized) if serialized
+
+    if serialized
+      entry["sha"] = Digest::SHA256.hexdigest(serialized)
+
+      # Only recorded when the value contains a hash whose insertion order is not
+      # already the sorted order -- otherwise every constant in the snapshot would
+      # carry a duplicate digest. A missing order_sha therefore means "order and
+      # content agree", which is what the comparator falls back to.
+      ordered = safe { serialize_value(value, canonical: false) }
+      entry["order_sha"] = Digest::SHA256.hexdigest(ordered) if ordered && ordered != serialized
+    end
 
     out[const_name.to_s] = entry
   end
@@ -1245,7 +1322,15 @@ autoloaded_files =
     next [] unless defined?(ActiveSupport::Dependencies)
     next [] unless ActiveSupport::Dependencies.respond_to?(:history)
 
-    ActiveSupport::Dependencies.history.map { |f| normalize_path(f) }.compact.uniq.sort
+    # Deliberately NOT sorted. require_or_load appends to history *after* the
+    # file finishes loading ("Record history *after* loading so first load gets
+    # warnings"), which makes this classic's completion order -- the counterpart
+    # to $LOADED_FEATURES on the Zeitwerk side, and the only such signal there,
+    # since classic loads app files with Kernel#load. find_load_cycles.rb needs
+    # it to tell a file that was still executing from one that had finished.
+    # Everything downstream of this treats it as a set, so losing the sort costs
+    # nothing.
+    ActiveSupport::Dependencies.history.map { |f| normalize_path(f) }.compact.uniq
   end || []
 
 preload_script = safe { File.expand_path(__dir__) }

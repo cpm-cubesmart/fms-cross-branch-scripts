@@ -77,6 +77,7 @@ convenient and less faithful.
 | `script/dump_runtime_snapshot.rb` | `rails runner` script. Walks `ObjectSpace`, writes the snapshot JSON plus a `.sources.json` sidecar of method bodies. |
 | `script/compare_runtime_snapshots.rb` | Diffs two snapshots, applies the rename map, prints the report. |
 | `script/dump_git_renames.rb` | Builds the old → new path map from `git diff --name-status -M`. |
+| `script/find_load_cycles.rb` | Takes one snapshot and reports files that were read while still loading. |
 | `test/selftest.sh` | End-to-end test of all of the above against generated fixtures. |
 | `RUNBOOK.md` | How to actually run it. |
 | `ignore.example.txt` | Template for the triage allowlist. |
@@ -135,6 +136,16 @@ moving a file, and wrapping a top-level class in a module namespace. Comments an
 formatting stop counting too, which is correct for "does this method behave
 differently". The source text is still captured to a sidecar, for reading by hand
 when a reported change is surprising.
+
+**Re-entrant loads are found separately, from a single snapshot.** The comparison
+answers "do the two branches differ"; `bin/cycles` answers "was any file read
+while it was still being written". That failure has no error, no exception and no
+missing constant — on this application it silently cost one class all 622 of its
+generated accessors, because a macro in a class body iterated a hash that the file
+still loading above it had not finished populating. The snapshot already records
+the two orderings needed to detect it (a class-body trace for starts,
+`$LOADED_FEATURES` and `Dependencies.history` for completions), so no extra
+instrumentation was required. See [RUNBOOK section 14](runtime-snapshot/RUNBOOK.md#14-finding-re-entrant-loads).
 
 ## Scope
 

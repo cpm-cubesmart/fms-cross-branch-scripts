@@ -572,6 +572,7 @@ end
 # ---------------------------------------------------------------------------
 
 constant_value_changes = []
+constant_value_order_only = []
 
 common.each do |name|
   values_a = CONSTANTS_A[name]["values"] || {}
@@ -593,7 +594,19 @@ common.each do |name|
     end
 
     next if va["sha"].nil? || vb["sha"].nil?
-    next if va["sha"] == vb["sha"]
+
+    # "sha" digests hash pairs sorted, so it answers "same keys, same values".
+    # "order_sha" keeps insertion order and is recorded only when it differs from
+    # the sorted form -- so its absence means the two already agree, which is why
+    # the fallback is to "sha" rather than to nil.
+    if va["sha"] == vb["sha"]
+      order_a = va["order_sha"] || va["sha"]
+      order_b = vb["order_sha"] || vb["sha"]
+      next if order_a == order_b
+
+      constant_value_order_only << { "constant" => label, "kind" => va["kind"] }
+      next
+    end
 
     constant_value_changes << {
       "constant" => label, "status" => "changed",
@@ -871,6 +884,7 @@ counts = {
   "association_changes" => association_changes.length,
   "class_attribute_changes" => class_attribute_changes.length,
   "class_attribute_order_only" => class_attribute_order_only.length,
+  "constant_value_order_only" => constant_value_order_only.length,
   "resolution_super_only" => resolution_super_only.length,
   "attribute_ownership_only" => attribute_ownership_only.length,
   "resolution_order_changes" => resolution_changes.length,
@@ -903,8 +917,8 @@ SEMANTIC_SECTIONS = %w[
 # order of magnitude more of them. Keeping them out of the semantic total is what
 # lets the membership changes be seen.
 INFORMATIONAL_SECTIONS = %w[
-  class_attribute_order_only resolution_super_only attribute_ownership_only
-  files_only_a files_only_b
+  class_attribute_order_only constant_value_order_only resolution_super_only
+  attribute_ownership_only files_only_a files_only_b
 ].freeze
 
 semantic_total = SEMANTIC_SECTIONS.sum { |k| IGNORE.section?(k) ? 0 : counts[k] }
@@ -939,7 +953,7 @@ end
 # Keep in step with SCRIPT_VERSION in dump_runtime_snapshot.rb. The mismatch
 # check above only catches a mixed pair; two equally stale snapshots would
 # compare cleanly and quietly reproduce whatever the old dumper got wrong.
-EXPECTED_SCRIPT_VERSION = 12
+EXPECTED_SCRIPT_VERSION = 13
 
 if id_a["script_version"] == id_b["script_version"] &&
    id_a["script_version"].to_i < EXPECTED_SCRIPT_VERSION
@@ -1012,6 +1026,7 @@ if options[:format] == "json"
     "association_changes" => association_changes,
     "class_attribute_changes" => class_attribute_changes,
     "class_attribute_order_only" => class_attribute_order_only,
+    "constant_value_order_only" => constant_value_order_only,
     "resolution_super_only" => resolution_super_only,
     "attribute_ownership_only" => attribute_ownership_only,
     "resolution_order_changes" => resolution_changes,
@@ -1139,12 +1154,25 @@ section("constant_value_changes", "Constants whose value differs", constant_valu
               "numbers, booleans, nil, and arrays/hashes/sets of those. A constant " \
               "holding anything else records its kind and is never reported as changed. " \
               "Absolute paths are normalized, so a Rails.root.join(...) constant does not " \
-              "differ merely because the checkouts sit at different paths.") do |row|
+              "differ merely because the checkouts sit at different paths. Hash pairs are " \
+              "digested sorted -- a hash that only reordered is below, not here. `-` and " \
+              "`+` mean one side has no record of the constant at all, not that the values " \
+              "were compared and found different.") do |row|
   case row["status"]
-  when "only_in_a" then puts "  - #{row['constant']}   (#{row['a']}, only in #{label_a})"
-  when "only_in_b" then puts "  + #{row['constant']}   (#{row['b']}, only in #{label_b})"
+  when "only_in_a" then puts "  - #{row['constant']}   (#{row['a']}, not recorded in #{label_b})"
+  when "only_in_b" then puts "  + #{row['constant']}   (#{row['b']}, not recorded in #{label_a})"
   else                  puts "  ~ #{row['constant']}   (#{row['a']})"
   end
+end
+
+section("constant_value_order_only", "Constant hashes reordered, contents identical",
+        constant_value_order_only,
+        note: "Same keys, same values, different insertion order. Ruby preserves hash " \
+              "order, so this is visible to #each and #first -- but a constant hash built " \
+              "by iterating something that follows load order reorders for reasons " \
+              "unrelated to behaviour, and one such constant here produced a different " \
+              "digest on two runs of the same branch.") do |row|
+  puts "  ~ #{row['constant']}   (#{row['kind']}, order only)"
 end
 
 section("association_changes", "Associations differ", association_changes,
