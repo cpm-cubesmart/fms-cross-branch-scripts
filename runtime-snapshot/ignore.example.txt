@@ -11,6 +11,15 @@
 # Format: one rule per line, "<kind> <pattern>". Patterns are globs
 # (File.fnmatch), # starts a comment.
 #
+# A rule that does not parse, and a rule that matches nothing, are both reported
+# as warnings in the diff header. If you add a rule and the count does not move,
+# read those before assuming the rule was right.
+#
+# Path globs are matched with FNM_PATHNAME, so "*" does not cross "/" and a
+# trailing "/**" would otherwise mean one directory level only. "foo/**" is
+# rewritten to "foo/**/*" so it recurses; write "foo/*" if you want one level.
+# Constant, ancestor and method globs have no such rule -- "*" crosses "::".
+#
 #   constant <glob>   ignore a constant entirely -- its ancestors, methods,
 #                     source and reopen order all stop being reported
 #   ancestor <glob>   ignore one module wherever it appears *inside* an ancestor
@@ -45,7 +54,7 @@
 # section line_only_changes
 
 # Vendored code we are not migrating.
-# file vendor/**
+# file vendor/**/*
 
 # Deliberately reimplemented on the zeitwerk branch.
 # method LegacyReport#to_csv

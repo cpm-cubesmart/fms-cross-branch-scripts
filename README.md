@@ -89,11 +89,23 @@ finishes, so a `TracePoint` installed there misses the entire window of
 interest. The `RUBYOPT` preload runs before Bundler, before `config/boot.rb`,
 before `config/application.rb`.
 
-**`$LOADED_FEATURES` for load order.** It is append-ordered by the VM, which
-makes it the only load-order source that survives both Bootsnap's
-instruction-sequence cache and autoload-triggered requires that never pass
-through a Ruby-level `Kernel#require`. A `:script_compiled` trace is available
-via `SNAPSHOT_TRACE_COMPILE=1` but is defeated by a warm Bootsnap cache.
+**Three signals for the load set, because no one of them works on both
+branches.** `$LOADED_FEATURES` is append-ordered by the VM and survives Bootsnap's
+instruction-sequence cache — but classic autoloading loads application files with
+`Kernel#load`, which never registers there, so on the classic branch it is missing
+essentially the whole application. Comparing it alone reported 3,747 files as
+"Zeitwerk only" when 99% of them had demonstrably executed on both.
+
+The preboot `TracePoint(:class)` sees anything that runs a `class` or `module`
+body however it was loaded, but is blind to a file that only does
+`Foo.class_eval { ... }`. `ActiveSupport::Dependencies.history` is classic's own
+record of what it `require_or_load`ed, and is the only signal that sees that last
+category on the classic side. The comparison uses the union of all three — after
+restoring the `.rb` that `require_or_load` chomps, or every autoloaded file would
+appear on the classic side under a name the others never use.
+
+A `:script_compiled` trace is available via `SNAPSHOT_TRACE_COMPILE=1` but is
+defeated by a warm Bootsnap cache.
 
 **Nothing is ever `constantize`d.** Constants are enumerated through
 `ObjectSpace`, never by resolving names. In non-eager mode the whole point is to
@@ -101,10 +113,28 @@ observe what boot alone loaded; a snapshot that triggers autoloads while looking
 at them is measuring itself. (`Module.const_source_location`, which the dumper
 does call, was verified not to resolve pending autoloads.)
 
-**Method source is indentation-normalized before hashing.** Wrapping a
-previously top-level class in a module namespace re-indents every line without
-changing a token — extremely common in this migration. Hashing raw text would
-report every method in the file as changed and bury the real findings.
+**The report answers five questions and nothing else:** which classes are not
+loaded on one side, which method name now resolves to a different definition,
+which method bodies changed, which constant values changed, and which classes
+gained or lost methods. Sections that described the *mechanism* rather than the
+outcome — reopen order, whole-chain ancestor reordering, line-number moves, load
+order — were removed, because on a real migration they outnumbered the findings
+by two orders of magnitude.
+
+**Method bodies are compared by their compiled instruction sequence, not by
+source text.** Locating source through `source_location` is unreliable for
+anything metaprogrammed: for a `define_method` accessor it points at the line
+that generated the method, so the text there is unrelated — or, as with all 626
+of `FacilitySettings`' generated accessors, there is nothing usable at all and a
+real change is invisible. That was 13% of every method in the application.
+
+`RubyVM::InstructionSequence.of` has neither problem, and normalizing away
+bytecode offsets, line annotations, file paths and enclosing-scope labels leaves
+a digest that is stable across the two edits this migration makes constantly:
+moving a file, and wrapping a top-level class in a module namespace. Comments and
+formatting stop counting too, which is correct for "does this method behave
+differently". The source text is still captured to a sidecar, for reading by hand
+when a reported change is surprising.
 
 ## Scope
 

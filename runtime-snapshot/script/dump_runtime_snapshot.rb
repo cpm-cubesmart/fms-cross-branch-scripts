@@ -36,6 +36,7 @@
 POST_BOOT_FEATURES = $LOADED_FEATURES.dup
 
 require "json"
+require "set"
 require "digest"
 require "rbconfig"
 require "time"
@@ -84,7 +85,33 @@ end
 
 # 2: namespace closure -- namespaces Zeitwerk autovivifies are recorded rather
 #    than dropped for owning no methods and no application-side definition site.
-SCRIPT_VERSION = 2
+# 3: ancestor_methods -- method names for every module appearing in a chain, so
+#    the comparator can tell a reordering that changes dispatch from one that
+#    cannot. Chains reference roughly twice as many modules as are in scope.
+# 4: anonymous ancestor labels carry the constant that owns them. The origin file
+#    alone is not an identity -- one store_accessor label covered 258 modules.
+# 5: source_sha is only recorded when the extracted text is actually a definition.
+#    It used to hash whatever statement sat on a metaprogrammed method's
+#    source_location line, which was two thirds of all reported body changes.
+# 6: body_sha -- method bodies are digested from the compiled instruction
+#    sequence instead of from source text. 13% of methods had no source digest at
+#    all, including every dynamically defined accessor.
+# 7: constant values, and singleton labels no longer carry ActiveRecord's
+#    "call X.connection to establish a connection" advisory.
+# 8: constant values that are absolute paths are normalized, so a
+#    Rails.root.join(...) constant no longer differs merely because the two
+#    checkouts sit at different paths.
+# 9: class_attributes -- __callbacks, _validators, default_scopes and the
+#    resolved action callbacks. `included do` side effects were invisible to
+#    every other section.
+# 10: those values are stored structured (chain => filters) instead of a capped
+#    summary string, so the comparator can say which filter moved or vanished.
+#    The cap put the difference out of reach on the rows that mattered.
+# 11: associations. A lost has_many was invisible everywhere else -- the readers
+#    live in GeneratedAssociationMethods, which is excluded.
+# 12: load_order.autoloaded -- classic's own require_or_load record. $LOADED_FEATURES
+#    misses everything classic autoloads, because it uses Kernel#load.
+SCRIPT_VERSION = 12
 
 OUT_PATH        = ENV["SNAPSHOT_OUT"]
 SOURCES_PATH    = ENV["SNAPSHOT_SOURCES_OUT"]
@@ -342,6 +369,12 @@ end
 
 SOURCE_TEXTS = {}
 
+# Surfaced as counts.body_digests. Bootsnap loads instruction sequences from a
+# binary cache, and if that turned out to defeat RubyVM::InstructionSequence.of
+# every body comparison would silently become a no-op. This is the number that
+# says so on the first run rather than after a confusing report.
+BODY_DIGEST_COUNT = [0]
+
 # Returns [source_kind, source_sha]. source_kind explains *why* there is no sha
 # when there isn't one, so a missing hash is never ambiguous:
 #
@@ -382,11 +415,340 @@ def method_source(unbound_method, normalized_file)
   return ["unreadable", nil] if first.negative? || last >= lines.length || last < first
 
   text = normalize_source(lines[first..last].join)
+
+  # Keeps the sidecar honest about what it holds.
+  #
+  # source_location for a metaprogrammed method points at the line that GENERATED
+  # it, not at a definition -- a `has_many`, an `include`, an element of a symbol
+  # list. RubyVM::AbstractSyntaxTree.of then hands back a SCOPE node spanning that
+  # single line, and the fallback in source_range_for takes it without checking
+  # the type, so whatever statement happens to live there would be stored as if it
+  # were the method body. Nothing compares source text any more -- bodies are
+  # compared by instruction sequence -- but a sidecar full of unrelated `include`
+  # lines would mislead the next person who opens it to investigate a row.
+  return ["generated", nil] unless text.lstrip.start_with?("def ", "def(", "define_method")
+
   sha = Digest::SHA256.hexdigest(text)
 
   SOURCE_TEXTS[sha] = text if CAPTURE_SOURCES
 
   ["ruby", sha]
+end
+
+# ---------------------------------------------------------------------------
+# Body digest
+#
+# What the method actually compiles to, which is the only description of a method
+# body that does not depend on source_location being trustworthy.
+#
+# It is not, for anything metaprogrammed. Sometimes it points at the line that
+# generated the method and the text there is unrelated -- two thirds of the body
+# changes this tool used to report were an `include` or a `has_many` sitting at
+# the wrong line number. Sometimes there is nothing usable at all: every one of
+# FacilitySettings' 626 generated accessors had no digest whatsoever, so a real
+# difference in them was invisible. 13% of all methods were in that state.
+#
+# The instruction sequence has neither problem. Verified on 2.7.6: identical
+# bodies hash equal across a file rename, a class rename, a line shift and a
+# comment edit, and differ as soon as the code does.
+# ---------------------------------------------------------------------------
+
+# Everything that identifies WHERE the code lives rather than WHAT it does. The
+# last two matter most on this migration: without them, namespacing a class or
+# moving a file would change the digest of every method containing a block.
+def normalize_disasm(text)
+  text.lines.filter_map do |line|
+    next if line.start_with?("== disasm", "== catch table", "local table", "|")
+
+    line = line.sub(/\A\s*\d{4} /, "")               # bytecode offset
+    line = line.gsub(/\(\s*\d+\)(\[[^\]]*\])?/, "")  # "( 3)" and "( 3)[LiCa]"
+    line = line.gsub(/ in <[^>]*>/, "")              # "block (2 levels) in <class:Foo>"
+    line = line.gsub(%r{/\S+\.rb}, "")               # absolute paths
+    line = line.rstrip
+
+    line.empty? ? nil : line
+  end.join("\n")
+end
+
+# Returns [body_kind, body_sha], mirroring method_source: when there is no digest
+# the kind says why.
+#
+#   "iseq"        -> digested
+#   "native"      -> C function, there is no instruction sequence
+#   "gem"         -> outside Rails.root, skipped by the same policy as source text
+#   "unavailable" -> a Ruby method whose iseq could not be read. Should be rare;
+#                    if it is not, see counts.body_digests and the Bootsnap note
+#                    in the runbook.
+def body_digest(unbound_method, normalized_file)
+  # Order matters: a C function has no source_location, so the app_path? test
+  # below would call it a gem method and the native kind would never be reached.
+  return ["native", nil] if safe { unbound_method.source_location }.nil?
+  return ["gem", nil] unless app_path?(normalized_file)
+
+  iseq = safe { RubyVM::InstructionSequence.of(unbound_method) }
+
+  return ["unavailable", nil] if iseq.nil?
+
+  disasm = safe { iseq.disasm }
+
+  return ["unavailable", nil] if disasm.nil?
+
+  ["iseq", Digest::SHA256.hexdigest(normalize_disasm(disasm))]
+end
+
+# ---------------------------------------------------------------------------
+# Constant values
+#
+# Constants that are Modules or Classes are captured as constants in their own
+# right. This covers everything else -- LIMIT = 50, KINDS = %w[...] -- whose
+# value can differ when load order changes which assignment ran last.
+#
+# Only values with a stable, meaningful serialization get a digest. Anything else
+# records its kind and no digest, so the comparator can say "not comparable"
+# rather than inventing a difference out of an object address.
+# ---------------------------------------------------------------------------
+
+UM_CONSTANTS = Module.instance_method(:constants)
+UM_CONST_GET = Module.instance_method(:const_get)
+UM_AUTOLOAD_P = Module.instance_method(:autoload?)
+
+MAX_VALUE_DEPTH = 6
+MAX_VALUE_ITEMS = 500
+
+# Returns a canonical string, or nil when the value is not worth digesting.
+# Order-sensitive by design: if load order changes the order of a literal, that
+# is exactly the finding.
+def serialize_value(value, depth = 0)
+  return nil if depth > MAX_VALUE_DEPTH
+
+  case value
+  when nil, true, false then value.inspect
+  when Integer, Float   then value.inspect
+  when String
+    # A constant holding Rails.root.join(...) differs between two checkouts for
+    # no reason except where they sit on disk -- and that was 15 of the first 17
+    # value differences reported against the real application. normalize_path is
+    # the same rule the rest of the snapshot uses for every file path it records.
+    #
+    # Guarded on a leading "/" deliberately: a string that merely contains a
+    # path-shaped fragment should still be compared literally.
+    "s#{(value.start_with?('/') ? normalize_path(value) || value : value).inspect}"
+  when Symbol           then "y#{value.inspect}"
+  when Array
+    return nil if value.length > MAX_VALUE_ITEMS
+
+    parts = value.map { |v| serialize_value(v, depth + 1) }
+    parts.any?(&:nil?) ? nil : "[#{parts.join(',')}]"
+  when Hash
+    return nil if value.length > MAX_VALUE_ITEMS
+
+    parts = value.map do |k, v|
+      key = serialize_value(k, depth + 1)
+      val = serialize_value(v, depth + 1)
+      key && val ? "#{key}=>#{val}" : nil
+    end
+    parts.any?(&:nil?) ? nil : "{#{parts.join(',')}}"
+  when Set
+    parts = value.to_a.map { |v| serialize_value(v, depth + 1) }
+    parts.any?(&:nil?) ? nil : "#<Set:[#{parts.sort.join(',')}]>"
+  end
+end
+
+def value_kind(value)
+  case value
+  when nil then "nil"
+  when true, false then "boolean"
+  when Integer then "integer"
+  when Float then "float"
+  when String then "string"
+  when Symbol then "symbol"
+  when Array then "array"
+  when Hash then "hash"
+  when Set then "set"
+  when Proc, Method then "callable"
+  else value.class.to_s
+  end
+end
+
+# ---------------------------------------------------------------------------
+# Class attribute values
+#
+# Ancestors and method sets cannot see what an `included do ... end` block did.
+# Registering a callback, composing a default_scope and declaring a validation
+# all leave the chain and the method list untouched -- they write a value into a
+# class_attribute -- so a load-order change that stops one of them happening is
+# invisible to every other section.
+#
+# It surfaced on this migration as four mailer classes losing OWNERSHIP of
+# __callbacks while their chains, their methods and every other class_attribute
+# stayed identical. That said something changed; it could not say whether the
+# callbacks themselves differed.
+#
+# A curated list rather than every class_attribute: _routes, _layout,
+# default_params and the rest are expected to differ and would need their own
+# triage pass. These four carry behaviour.
+# ---------------------------------------------------------------------------
+
+CLASS_ATTRIBUTES = %w[
+  __callbacks
+  _validators
+  default_scopes
+  _process_action_callbacks
+].freeze
+
+MAX_SUMMARY = 300
+
+# An ActiveSupport::CallbackChain is a live object -- ordering and identity are
+# stable, the object is not. What matters is which filters run in which order, so
+# each chain reduces to its filter list. A filter that is not a symbol (a proc, a
+# callable object) is recorded by class: its identity would churn every run.
+def serialize_filters(chain)
+  chain.map do |entry|
+    # An ActiveSupport::Callback wraps the thing that runs; a validator or a
+    # default_scope is the thing itself. Unwrap only when there is something to
+    # unwrap, or every non-callback attribute serializes to a list of <nil>.
+    filter = safe(false) { entry.respond_to?(:filter) } ? safe { entry.filter } : entry
+
+    case filter
+    when Symbol, String then filter.to_s
+    when nil then "<nil>"
+    else "<#{safe { filter.class.to_s } || 'unknown'}>"
+    end
+  end
+end
+
+MAX_CHAIN = 400
+
+# Structured, not a formatted string. The comparator has to diff these per chain
+# and say "one filter moved" or "one filter is gone" -- a flat summary made every
+# row two long, near-identical blobs with the difference somewhere in the middle,
+# and truncating it put the difference out of reach entirely.
+#
+# Returns { chain name => [filter, ...] }, or nil when the value is not shaped
+# like something worth comparing.
+def serialize_class_attribute(value)
+  case value
+  when Hash
+    # __callbacks: name => CallbackChain. _validators: attribute => [validator].
+    out = {}
+
+    value.each do |name, chain|
+      return nil unless safe(false) { chain.respond_to?(:map) }
+
+      out[name.to_s] = serialize_filters(chain).first(MAX_CHAIN)
+    end
+
+    out
+  when Array
+    # default_scopes and friends: one unnamed list.
+    { "(list)" => serialize_filters(value).first(MAX_CHAIN) }
+  end
+end
+
+# ---------------------------------------------------------------------------
+# Associations
+#
+# A lost `has_many` is invisible to every other section: the reader methods live
+# in GeneratedAssociationMethods, which is excluded as a timing artifact, and the
+# reflection is not a constant, a method the class owns, or an ancestor. It
+# surfaced once here only by accident -- as a missing autosave_associated_records
+# callback -- and that is not a mechanism to rely on. Associations decide what
+# `descendants`-driven and STI queries do, so they get captured directly.
+# ---------------------------------------------------------------------------
+
+# Never touches reflection.klass, .table_name or anything else that constantizes
+# or reaches for a connection: that would autoload the target and corrupt the
+# non-eager snapshot, which is the one invariant this script cannot break.
+def association_records(mod)
+  singleton = mod_singleton_class(mod)
+  return {} if singleton.nil?
+
+  reflector = :reflect_on_all_associations
+  return {} unless safe(false) { UM_INSTANCE_METHODS.bind(singleton).call(true).include?(reflector) }
+
+  reflections = safe { mod.public_send(reflector) } || []
+  out = {}
+
+  reflections.each do |reflection|
+    name = safe { reflection.name.to_s }
+    next if name.nil?
+
+    options = safe({}) { reflection.options } || {}
+
+    # Option keys are recorded even when the value will not serialize, so an
+    # option arriving or vanishing is visible whatever it holds.
+    serialized = options.keys.sort_by(&:to_s).to_h do |key|
+      value = options[key]
+      # inspect, not serialize_value: this string is displayed as well as
+      # digested, and serialize_value's type prefixes (y:foo for a symbol) are
+      # for disambiguating a hash, not for reading.
+      readable =
+        case value
+        when nil, true, false, Integer, Float, String, Symbol then safe { value.inspect }
+        when Array, Hash then safe { serialize_value(value) }
+        end
+
+      [key.to_s, readable || "<#{safe { value.class.to_s } || 'unknown'}>"]
+    end
+
+    out[name] = {
+      "macro" => safe { reflection.macro.to_s } || "unknown",
+      "options" => serialized
+    }
+  end
+
+  out.sort.to_h
+end
+
+def class_attribute_values(mod)
+  singleton = mod_singleton_class(mod)
+  return {} if singleton.nil?
+
+  out = {}
+
+  CLASS_ATTRIBUTES.each do |name|
+    # Read only. respond_to? through the unbound reflector so a hostile class
+    # cannot lie, and no attempt is ever made to define the reader.
+    next unless safe(false) { UM_INSTANCE_METHODS.bind(singleton).call(true).include?(name.to_sym) }
+
+    value = safe { mod.public_send(name) }
+    next if value.nil?
+
+    chains = safe { serialize_class_attribute(value) }
+    entry = { "kind" => safe { value_kind(value) } || "unknown" }
+    entry["chains"] = chains.sort.to_h if chains
+
+    out[name] = entry
+  end
+
+  out
+end
+
+def constant_values(mod)
+  names = safe([]) { UM_CONSTANTS.bind(mod).call(false) } || []
+  out = {}
+
+  names.each do |const_name|
+    # THE line that makes this safe to run against a non-eager snapshot.
+    # Reading the value of a pending autoload would load it, and the whole point
+    # of the non-eager pair is to measure what boot alone loaded. Ruby's own
+    # autoload is visible here; Rails classic autoloading goes through
+    # const_missing, so an unloaded constant is simply not listed at all.
+    next if safe { UM_AUTOLOAD_P.bind(mod).call(const_name) }
+
+    value = safe { UM_CONST_GET.bind(mod).call(const_name, false) }
+
+    # Modules and classes are captured as constants elsewhere.
+    next if value.is_a?(Module)
+
+    serialized = safe { serialize_value(value) }
+    entry = { "kind" => safe { value_kind(value) } || "unknown" }
+    entry["sha"] = Digest::SHA256.hexdigest(serialized) if serialized
+
+    out[const_name.to_s] = entry
+  end
+
+  out.sort.to_h
 end
 
 # ---------------------------------------------------------------------------
@@ -416,6 +778,9 @@ def collect_methods(owner, kind, out)
       line = location && location[1]
 
       source_kind, source_sha = method_source(unbound, file)
+      body_kind, body_sha = body_digest(unbound, file)
+
+      BODY_DIGEST_COUNT[0] += 1 if body_sha
 
       params =
         safe([]) { unbound.parameters } || []
@@ -428,7 +793,9 @@ def collect_methods(owner, kind, out)
         "file" => file,
         "line" => line,
         "source" => source_kind,
-        "source_sha" => source_sha
+        "source_sha" => source_sha,
+        "body" => body_kind,
+        "body_sha" => body_sha
       }
     end
   end
@@ -470,7 +837,55 @@ end
 # actually tells you which mixin moved.
 # ---------------------------------------------------------------------------
 
+# Anonymous module -> [owning chain length, owning constant name].
+#
+# The origin file alone is not an identity: every class calling store_accessor
+# gets its own Module.new whose methods are all define_method'd inside
+# active_record/store.rb, so hundreds of distinct modules would share one label.
+# The report then cannot say which one moved, and the ancestor_methods map unions
+# all of their methods into a single useless entry.
+#
+# The owner is the MOST SPECIFIC constant whose chain contains the module --
+# smallest ancestor chain, ties broken by name so it stays deterministic.
+# "The only constant that contains it" would be wrong: a class's own generated
+# module is also in every subclass's chain, and a concern's module is in the
+# chain of everything that includes the concern. Smallest-chain picks the class
+# itself in the first case and the concern in the second, which is the answer
+# wanted in both. A module genuinely included into two unrelated constants gets
+# an arbitrary but stable one of them.
+ANON_OWNER = {}.compare_by_identity
+
+def record_anonymous_owners(owner_name, mod)
+  [mod, mod_singleton_class(mod)].each do |root|
+    next if root.nil?
+
+    list = safe { UM_ANCESTORS.bind(root).call }
+    next if list.nil?
+
+    candidate = [list.length, owner_name]
+
+    list.each do |ancestor|
+      name = mod_name(ancestor)
+      next if name && !name.empty?
+
+      current = ANON_OWNER[ancestor]
+      ANON_OWNER[ancestor] = candidate if current.nil? || (candidate <=> current) == -1
+    end
+  end
+end
+
+# Reflection over every method of every anonymous module, repeated for each of the
+# thousands of chains it appears in, is pure waste -- the answer cannot change.
+ANON_LABEL_CACHE = {}.compare_by_identity
+
 def anonymous_label(mod)
+  cached = ANON_LABEL_CACHE[mod]
+  return cached if cached
+
+  ANON_LABEL_CACHE[mod] = compute_anonymous_label(mod)
+end
+
+def compute_anonymous_label(mod)
   kind = mod_class?(mod) ? "class" : "module"
 
   files =
@@ -480,8 +895,10 @@ def anonymous_label(mod)
     end || []
 
   origin = files.compact.map { |f| normalize_path(f) }.compact.uniq.sort.first
+  owner = ANON_OWNER[mod]&.last
+  qualified = owner ? "anonymous #{kind} of #{owner}" : "anonymous #{kind}"
 
-  origin ? "#<anonymous #{kind} @ #{origin}>" : "#<anonymous #{kind}>"
+  origin ? "#<#{qualified} @ #{origin}>" : "#<#{qualified}>"
 end
 
 def ancestor_label(mod)
@@ -491,11 +908,55 @@ def ancestor_label(mod)
 
   # Singleton classes have no name but a stable, meaningful inspect
   # ("#<Class:Facility>"), which is exactly the label we want.
+  #
+  # ActiveRecord overrides inspect on classes without an established connection,
+  # giving "#<Class:Facility (call 'Facility.connection' to establish a
+  # connection)>". These labels are now the identity of a row in the resolution
+  # order section, so the advisory tail has to go -- it depends on connection
+  # state rather than on the class.
   inspected = normalize_anonymous(mod_inspect(mod))
+  inspected = inspected.sub(/\A(#<Class:[^\s>]+)\s.*>\z/, '\1>') if inspected
 
   return inspected if inspected&.start_with?("#<Class:") && !inspected.include?("ANONYMOUS")
 
   anonymous_label(mod)
+end
+
+# Method names owned by every module that turns up in any ancestor chain, keyed
+# by the label the chain uses.
+#
+# The comparator needs this to answer the only question that makes a reordering
+# matter for dispatch: did the module that moved cross anything defining the same
+# method name? It cannot answer that from the constants alone -- chains reference
+# roughly twice as many modules as are in scope, and the gem mixins that sit in
+# every ActiveRecord chain own no application code, so they are never captured.
+#
+# One rule covers both chains: the methods a member contributes are its OWN
+# instance methods. In a singleton chain the members are singleton classes and
+# extended modules, whose instance methods are exactly what dispatches there.
+ANCESTOR_METHODS = {}
+
+# Identity-keyed so each distinct module is reflected once no matter how many
+# chains it appears in. compare_by_identity never calls #hash or #eql? on the
+# key, which keeps it safe against classes that override them.
+ANCESTOR_METHODS_SEEN = {}.compare_by_identity
+
+def record_ancestor_methods(label, mod)
+  return if ANCESTOR_METHODS_SEEN.key?(mod)
+
+  ANCESTOR_METHODS_SEEN[mod] = true
+
+  names =
+    [UM_INSTANCE_METHODS, UM_PROTECTED_METHODS, UM_PRIVATE_METHODS].flat_map do |reflector|
+      (safe([]) { reflector.bind(mod).call(false) } || []).map(&:to_s)
+    end
+
+  # Union rather than first-wins. Two distinct anonymous modules can share a
+  # label, and which one is visited first depends on ObjectSpace order -- taking
+  # either would make the snapshot nondeterministic. Union is order-independent,
+  # and erring towards more names is the safe direction for overlap detection.
+  existing = ANCESTOR_METHODS[label]
+  ANCESTOR_METHODS[label] = existing ? existing | names : names
 end
 
 def ancestors_of(mod)
@@ -503,7 +964,11 @@ def ancestors_of(mod)
 
   return nil if list.nil?
 
-  list.map { |ancestor| ancestor_label(ancestor) }
+  list.map do |ancestor|
+    label = ancestor_label(ancestor)
+    record_ancestor_methods(label, ancestor)
+    label
+  end
 end
 
 # ---------------------------------------------------------------------------
@@ -578,6 +1043,9 @@ def build_entry(mod, const_file, const_line, origin)
     "const_line" => const_line,
     "ancestors" => ancestors,
     "singleton_ancestors" => singleton_ancestors,
+    "values" => constant_values(mod),
+    "class_attributes" => class_attribute_values(mod),
+    "associations" => association_records(mod),
     "methods" => methods,
     "digests" => {
       "ancestors" => ancestors_digest,
@@ -624,6 +1092,12 @@ end
 skipped = []
 duplicates = []
 constants = {}
+
+# Constants that passed the scope test, held until the ownership pass below has
+# run. Records cannot be built inline any more, because building one labels its
+# whole ancestor chain and an anonymous module's label depends on chains that may
+# not have been walked yet.
+in_scope = []
 
 # Every named module on the heap, keyed by name. The namespace pass below needs
 # to turn a parent name back into a module object, and this is the only way to
@@ -680,14 +1154,25 @@ all_modules.each do |mod|
 
     app_names << normalized_name if origin == "app"
 
-    record_constant(constants, duplicates, normalized_name,
-                    build_entry(mod, const_file, const_line, origin))
+    in_scope << [normalized_name, mod, const_file, const_line, origin]
   rescue Exception => e # rubocop:disable Lint/RescueException
     # Recorded rather than dropped. A subsystem that systematically explodes
     # during introspection would otherwise be absent from both snapshots and
     # look like agreement.
     skipped << { "name" => name, "error" => "#{e.class}: #{e.message}" }
   end
+end
+
+# Attribute anonymous modules before anything is labelled: a label cannot be
+# computed until every chain that might claim ownership has been seen. Walks the
+# chains only -- no method reflection, which is what makes a second pass cheap.
+in_scope.each { |name, mod, _file, _line, _origin| safe { record_anonymous_owners(name, mod) } }
+
+in_scope.each do |name, mod, const_file, const_line, origin|
+  record_constant(constants, duplicates, name,
+                  build_entry(mod, const_file, const_line, origin))
+rescue Exception => e # rubocop:disable Lint/RescueException
+  skipped << { "name" => name, "error" => "#{e.class}: #{e.message}" }
 end
 
 # ---------------------------------------------------------------------------
@@ -724,6 +1209,11 @@ end
 namespace_names.uniq!
 namespace_names.sort!
 
+# These were not in the ownership pass -- they are being discovered now, after it
+# ran. An anonymous module reachable only from a rescued namespace therefore keeps
+# the unqualified label. Namespaces hold no methods of their own and their chains
+# are short, so in practice there is nothing here to attribute.
+
 namespace_names.each do |name|
   next if name.include?("#<Class:") || name.include?("#<Module:")
 
@@ -741,6 +1231,22 @@ end
 # ---------------------------------------------------------------------------
 # Load order
 # ---------------------------------------------------------------------------
+
+# Classic autoloading loads application files with Kernel#load, which does NOT
+# append to $LOADED_FEATURES -- so on the classic branch the file-level record
+# above is missing essentially the whole application. ActiveSupport::Dependencies
+# keeps its own record of what it require_or_load'ed, and that is the only signal
+# that sees a file which monkey-patches without ever executing a class body.
+#
+# Under Zeitwerk, unhook! leaves this an empty Set. That is correct: there,
+# $LOADED_FEATURES already has everything.
+autoloaded_files =
+  safe([]) do
+    next [] unless defined?(ActiveSupport::Dependencies)
+    next [] unless ActiveSupport::Dependencies.respond_to?(:history)
+
+    ActiveSupport::Dependencies.history.map { |f| normalize_path(f) }.compact.uniq.sort
+  end || []
 
 preload_script = safe { File.expand_path(__dir__) }
 
@@ -858,6 +1364,7 @@ snapshot = {
   "paths" => paths,
   "load_order" => {
     "files" => loaded_files,
+    "autoloaded" => autoloaded_files,
     "class_bodies" => class_bodies,
     "script_compiled" => script_compiled,
     "dropped_class_events" => TRACE ? TRACE[:dropped_class_events] : nil
@@ -865,13 +1372,19 @@ snapshot = {
   "counts" => {
     "constants" => constants.size,
     "methods" => constants.values.sum { |c| c["methods"].length },
+    "body_digests" => BODY_DIGEST_COUNT[0],
     "loaded_files" => loaded_files.length,
+    "autoloaded" => autoloaded_files.length,
     "class_bodies" => class_bodies.length,
     "skipped" => skipped.length,
-    "duplicate_names" => duplicates.uniq.length
+    "duplicate_names" => duplicates.uniq.length,
+    "ancestor_modules" => ANCESTOR_METHODS.size
   },
   "skipped" => skipped.sort_by { |s| s["name"] },
   "duplicate_names" => duplicates.uniq.sort,
+  # Names only -- no parameters, source or digests. Deduplicated globally, so a
+  # module mixed into 4000 chains is stored once.
+  "ancestor_methods" => ANCESTOR_METHODS.sort.to_h.transform_values(&:sort),
   "constants" => constants.sort.to_h
 }
 

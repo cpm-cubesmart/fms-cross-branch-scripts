@@ -1,3 +1,6 @@
 output*
 runtime-snapshot/snapshots/
 *compare*.txt
+
+# Machine-specific driver scripts -- they hardcode checkout paths.
+local/
