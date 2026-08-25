@@ -953,7 +953,7 @@ end
 # Keep in step with SCRIPT_VERSION in dump_runtime_snapshot.rb. The mismatch
 # check above only catches a mixed pair; two equally stale snapshots would
 # compare cleanly and quietly reproduce whatever the old dumper got wrong.
-EXPECTED_SCRIPT_VERSION = 13
+EXPECTED_SCRIPT_VERSION = 14
 
 if id_a["script_version"] == id_b["script_version"] &&
    id_a["script_version"].to_i < EXPECTED_SCRIPT_VERSION

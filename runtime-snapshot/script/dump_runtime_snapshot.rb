@@ -121,7 +121,15 @@ end
 #    (c) load_order.autoloaded keeps insertion order, which is classic's file
 #        completion order. It was sorted, which made it useless for detecting a
 #        file that was read while still loading.
-SCRIPT_VERSION = 13
+# 14: a method a prepended module shadows is recorded from the OWNER's own
+#     definition. Module#instance_method resolves the ancestry, so every field
+#     for such a method -- file, line, source_sha, body_sha, params -- was read
+#     off the prepending module instead. Both branches shadowed identically, so
+#     the errors cancelled and nothing was reported; the cost was a false
+#     negative, since a real change to the class's own body digested as the
+#     module's and compared clean. 20 methods per boot in this app, all of them
+#     the engine-extension prepend pattern the migration is meant to watch.
+SCRIPT_VERSION = 14
 
 OUT_PATH        = ENV["SNAPSHOT_OUT"]
 SOURCES_PATH    = ENV["SNAPSHOT_SOURCES_OUT"]
@@ -153,6 +161,8 @@ UM_INSTANCE_METHOD    = Module.instance_method(:instance_method)
 UM_SINGLETON_CLASS    = ::Kernel.instance_method(:singleton_class)
 UM_IS_A               = ::Kernel.instance_method(:is_a?)
 UM_SUPERCLASS         = Class.instance_method(:superclass)
+UM_SUPER_METHOD       = UnboundMethod.instance_method(:super_method)
+UM_METHOD_OWNER       = UnboundMethod.instance_method(:owner)
 
 def safe(default = nil)
   yield
@@ -836,6 +846,29 @@ end
 # ancestors is covered by the ancestors chain instead.
 # ---------------------------------------------------------------------------
 
+# The method `owner` itself defines, not the one an instance of it would call.
+#
+# Module#instance_method resolves the ancestry, so for a class with a prepended
+# module defining the same name it hands back the MODULE's method -- and then
+# file, line, source_sha, body_sha and params all describe the wrong definition.
+# Callers get the name from instance_methods(false), so the owner really does
+# define it; walking super_method reaches its own copy.
+#
+# Returns nil rather than a wrong answer if the walk cannot get there, matching
+# the rest of this file: an absent record is recoverable, a confident wrong one
+# is not.
+def own_instance_method(owner, method_name)
+  unbound = safe { UM_INSTANCE_METHOD.bind(owner).call(method_name) }
+  depth = 0
+
+  while unbound && !safe { UM_METHOD_OWNER.bind(unbound).call }.equal?(owner)
+    unbound = safe { UM_SUPER_METHOD.bind(unbound).call }
+    return nil if (depth += 1) > 64
+  end
+
+  unbound
+end
+
 def collect_methods(owner, kind, out)
   return if owner.nil?
 
@@ -847,7 +880,7 @@ def collect_methods(owner, kind, out)
     names = safe([]) { reflector.bind(owner).call(false) } || []
 
     names.each do |method_name|
-      unbound = safe { UM_INSTANCE_METHOD.bind(owner).call(method_name) }
+      unbound = own_instance_method(owner, method_name)
       next if unbound.nil?
 
       location = safe { unbound.source_location }
@@ -890,7 +923,7 @@ def owns_app_code?(mod)
       names = safe([]) { reflector.bind(owner).call(false) } || []
 
       names.each do |method_name|
-        unbound = safe { UM_INSTANCE_METHOD.bind(owner).call(method_name) }
+        unbound = own_instance_method(owner, method_name)
         next if unbound.nil?
 
         location = safe { unbound.source_location }
@@ -968,7 +1001,7 @@ def compute_anonymous_label(mod)
   files =
     safe([]) do
       names = UM_INSTANCE_METHODS.bind(mod).call(false)
-      names.map { |n| safe { UM_INSTANCE_METHOD.bind(mod).call(n).source_location&.first } }
+      names.map { |n| safe { own_instance_method(mod, n)&.source_location&.first } }
     end || []
 
   origin = files.compact.map { |f| normalize_path(f) }.compact.uniq.sort.first

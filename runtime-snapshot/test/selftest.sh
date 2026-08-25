@@ -303,6 +303,70 @@ class ShadowChild < ShadowParent
 end
 RUBY
 
+# A method a prepended module shadows.
+#
+# Module#instance_method resolves the ancestry, so asking the CLASS for a method
+# the prepended module also defines hands back the module's. The dumper took the
+# names from instance_methods(false) -- correctly, the class's own -- and then
+# read file, line and body digest off the wrong method object.
+#
+# Prepended is the direct check: both records exist, and each must describe its
+# own definition.
+cat > "$WORK/classic/app/prepended.rb" <<'RUBY'
+module PrependedPatch
+  def value
+    :module_body
+  end
+end
+
+class Prepended
+  prepend PrependedPatch
+
+  def value
+    :own_body
+  end
+end
+RUBY
+
+cp "$WORK/classic/app/prepended.rb" "$WORK/zeitwerk/app/prepended.rb"
+
+# PrependedDrift is the consequence, and the reason this is worth a fixture: the
+# module's body is identical on both branches and the CLASS's own body is not.
+# Read through the module, both sides digest the same bytes and the pair compares
+# clean -- a real change to a real method, reported as no change at all. Which is
+# exactly the shape of an engine extension prepended over an app class.
+cat > "$WORK/classic/app/prepended_drift.rb" <<'RUBY'
+module PrependedDriftPatch
+  def compute
+    :module_body
+  end
+end
+
+class PrependedDrift
+  prepend PrependedDriftPatch
+
+  def compute
+    :classic_own_body
+  end
+end
+RUBY
+
+cat > "$WORK/zeitwerk/app/prepended_drift.rb" <<'RUBY'
+module PrependedDriftPatch
+  def compute
+    :module_body
+  end
+end
+
+class PrependedDrift
+  prepend PrependedDriftPatch
+
+  def compute
+    :zeitwerk_own_body
+  end
+end
+RUBY
+
 # Class attributes. The stub has no ActiveSupport, so these stand in for the
 # __callbacks shape: a singleton reader returning name => ordered filter list.
 #   Registrar  -- a filter stops being registered (the BaseMailer case)
@@ -537,6 +601,8 @@ ActiveSupport::Dependencies.history << File.expand_path("../app/patched_both", _
 require_relative "../app/assocs"
 require_relative "../app/classattrs"
 require_relative "../app/shadowing"
+require_relative "../app/prepended"
+require_relative "../app/prepended_drift"
 require_relative "../app/unhook"
 require_relative "../app/inherited"
 require_relative "../app/values"
@@ -646,6 +712,8 @@ require_relative "../app/patched_zeitwerk_only"
 require_relative "../app/assocs"
 require_relative "../app/classattrs"
 require_relative "../app/shadowing"
+require_relative "../app/prepended"
+require_relative "../app/prepended_drift"
 require_relative "../app/unhook"
 require_relative "../app/inherited"
 require_relative "../app/values"
@@ -775,6 +843,57 @@ assert_eq "--include-autoloader-shims brings it back" \
 
 # The guard on the collapse being too broad: OwnRequire shadows #require for its
 # own reasons, so its list changes by more than the arrival of Object.
+# The prepended-shadow record. `meth` reads one method out of one constant's own
+# method list -- the list the dumper built, so these assert what was recorded and
+# not what Ruby would answer now.
+meth() { # snapshot constant method field
+  ruby -rjson -e '
+    s = JSON.parse(File.read(ARGV[0]))
+    c = s["constants"][ARGV[1]] or abort "no constant #{ARGV[1]}"
+    m = (c["methods"] || []).find { |x| x["name"] == ARGV[2] && x["kind"] == "instance" }
+    puts m ? m[ARGV[3]].to_s : "(absent)"
+  ' "$WORK/snap/$1.json" "$2" "$3" "$4"
+}
+
+# Both own it, so both must be recorded -- reading the class's entry off the
+# module was the bug.
+assert_eq "a class and the module prepended over it both record the method" \
+  "true true" \
+  "$([ "$(meth classic Prepended value name)" != "(absent)" ] && printf true || printf false; printf ' '; [ "$(meth classic PrependedPatch value name)" != "(absent)" ] && printf true || printf false)"
+
+# The two definitions sit on different lines of one file. Reading through the
+# chain gave the class the module's line.
+assert_eq "the class's record points at its own definition, not the module's" \
+  "false" \
+  "$([ "$(meth classic Prepended value line)" = "$(meth classic PrependedPatch value line)" ] && printf true || printf false)"
+
+assert_eq "and its body digest is its own, not the module's" \
+  "false" \
+  "$([ "$(meth classic Prepended value body_sha)" = "$(meth classic PrependedPatch value body_sha)" ] && printf true || printf false)"
+
+# The module's own record was never wrong; assert it stayed right.
+assert_eq "the prepended module still records its own definition" \
+  "true" \
+  "$([ -n "$(meth classic PrependedPatch value body_sha)" ] && [ "$(meth classic PrependedPatch value body_sha)" != "(absent)" ] && printf true || printf false)"
+
+# The consequence, and the regression this fixture exists for: with both sides
+# digesting the module, this comparison came out clean.
+assert_eq "a change to a shadowed method's own body is reported" \
+  "1" \
+  "$(compare classic zeitwerk --format json | ruby -rjson -e '
+      puts JSON.parse($stdin.read)["method_set_changes"]
+              .select { |e| e["constant"] == "PrependedDrift" }
+              .sum { |e| e["changed"].length }')"
+
+# ...and reported against the class, not against the module, whose body is
+# identical on both branches.
+assert_eq "the prepended module is not reported as changed" \
+  "0" \
+  "$(compare classic zeitwerk --format json | ruby -rjson -e '
+      puts JSON.parse($stdin.read)["method_set_changes"]
+              .select { |e| e["constant"] == "PrependedDriftPatch" }
+              .sum { |e| e["changed"].length + e["removed"].length + e["added"].length }')"
+
 assert_eq "a class shadowing the same method for its own reasons still reports" \
   "1" \
   "$(res_rows | ruby -rjson -e 'puts JSON.parse(ARGV[0]).count { |r| r["examples"].include?("OwnRequire") }' "$(res_rows)")"
@@ -928,10 +1047,12 @@ set_field() { # field [compare args]
     | ruby -rjson -e 'puts JSON.parse($stdin.read)["method_set_changes"].sum { |r| r[ARGV[0]].length }' "$field"
 }
 
-# Widget#price (definition changed hands), the two DynamicAccessors bodies, and
-# the Registrar/Shuffled __callbacks readers -- whose bodies return the values.
+# Widget#price (definition changed hands), the two DynamicAccessors bodies, the
+# Registrar/Shuffled __callbacks readers -- whose bodies return the values -- and
+# PrependedDrift#compute, which is only visible once the class's own definition
+# is the one being digested.
 assert_eq "the method whose definition changed hands is reported" \
-  "6" "$(set_field changed)"
+  "7" "$(set_field changed)"
 
 # Widget#retired_helper is defined nowhere else, so it must NOT be annotated;
 # ShadowChild.setting still comes from the parent, so it must be.
@@ -1086,7 +1207,7 @@ fi
 # The zeitwerk fixture is indented one level deeper throughout. Only the one
 # method whose definition genuinely changed hands may show a source difference.
 assert_eq "re-indentation alone is not reported as a source change" \
-  "6" "$(set_field changed --renames "$WORK/renames.json")"
+  "7" "$(set_field changed --renames "$WORK/renames.json")"
 
 echo
 echo "-- guards --"
