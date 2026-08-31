@@ -1,0 +1,424 @@
+#!/usr/bin/env bash
+#
+# Rebuild every snapshot and both comparison reports, end to end.
+#
+#   local/refresh-all [--dry-run] [--only main|zeitwerk]
+#
+# Four Rails boots by default, sequentially: base and Zeitwerk, each in eager
+# and non-eager mode, then two comparison reports and one re-entrant-load
+# report. Eager loading is driven by EAGER_LOAD_APP, which both checkouts read in
+# config/environments/development.rb:
+#
+#   config.eager_load = ENV['EAGER_LOAD_APP'] == "true"
+#
+# --only narrows the booting to one checkout. The other checkout's two snapshots
+# are then reused exactly as they are on disk -- all three reports still cover
+# both branches, because the reports read snapshots, not checkouts. What is
+# reused is listed in preflight with its age and recorded eager_load, since a
+# stale side produces a report that looks perfectly healthy. local/refresh-zeitwerk
+# is a wrapper for --only zeitwerk, which is the shape of the RUNBOOK's
+# convergence loop: fix the Zeitwerk branch, re-snapshot it, re-read the reports.
+#
+# Not committed -- the checkout paths below are specific to this machine. Every
+# step delegates to runtime-snapshot/bin/*; there is no snapshot or comparison
+# logic here.
+#
+# Environment:
+#   MAIN_APP          base checkout          (default ~/code/fms)
+#   ZW_APP            Zeitwerk checkout      (default ~/code/fms-worktrees/...)
+#   RAILS_ENV         default development
+#   SKIP_SELFTEST=1   skip the self-test
+#   REFRESH_RENAMES=1 rebuild snapshots/renames.json before snapshotting
+#   RENAME_BASE       base ref for that rebuild (default: MAIN_APP's branch)
+
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$HERE/.." && pwd)"
+BIN="$REPO/runtime-snapshot/bin"
+SNAPSHOT_DIR="$REPO/runtime-snapshot/snapshots"
+
+MAIN_APP="${MAIN_APP:-$HOME/code/fms}"
+ZW_APP="${ZW_APP:-$HOME/code/fms-worktrees/zeitwerk_upgrade_low_impact}"
+export RAILS_ENV="${RAILS_ENV:-development}"
+
+LABELS=(main-eager main-noeager zeitwerk-eager zeitwerk-noeager)
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+step() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
+note() { printf '   %s\n' "$*"; }
+fail() { printf '\n\033[31m!! %s\033[0m\n' "$*" >&2; exit 1; }
+
+run() {
+  printf '   + %s\n' "$*"
+  [ "$DRY_RUN" -eq 1 ] || "$@"
+}
+
+elapsed() { printf '   (%dm%02ds)\n' $(( $1 / 60 )) $(( $1 % 60 )); }
+
+# identity.eager_load, straight out of a finished snapshot.
+snapshot_eager() {
+  ruby -rjson -e 'puts JSON.parse(File.read(ARGV[0]))["identity"]["eager_load"]' "$1"
+}
+
+snapshot_version() {
+  ruby -rjson -e 'puts JSON.parse(File.read(ARGV[0]))["identity"]["script_version"]' "$1"
+}
+
+# ---------------------------------------------------------------------------
+# Arguments
+#
+# Below the helpers so it can use fail(), and above everything else so a typo
+# costs nothing.
+# ---------------------------------------------------------------------------
+
+DRY_RUN=0
+ONLY=all              # all | main | zeitwerk
+
+usage() { echo "usage: $(basename "$0") [--dry-run] [--only main|zeitwerk]" >&2; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1 ;;
+    --only)    [ $# -ge 2 ] || { usage; exit 2; }; ONLY="$2"; shift ;;
+    --only=*)  ONLY="${1#--only=}" ;;
+    -h|--help) usage; exit 0 ;;
+    *)         usage; exit 2 ;;
+  esac
+  shift
+done
+
+# The two labels this run will boot come from ONLY; the other two are reused
+# from disk. REUSED is built here rather than at the snapshot calls because the
+# check on it belongs in preflight -- a missing snapshot should cost seconds,
+# not the ten minutes of booting that would otherwise come first.
+REUSED=()
+
+case "$ONLY" in
+  all)      ;;
+  main)     REUSED=(zeitwerk-eager zeitwerk-noeager) ;;
+  zeitwerk) REUSED=(main-eager main-noeager) ;;
+  *)        echo "$(basename "$0"): --only takes 'main' or 'zeitwerk', got '$ONLY'" >&2
+            usage
+            exit 2 ;;
+esac
+
+# ---------------------------------------------------------------------------
+# Preflight -- cheap checks before twenty minutes of booting
+# ---------------------------------------------------------------------------
+
+step "Checkouts"
+
+for pair in "base:$MAIN_APP" "zeitwerk:$ZW_APP"; do
+  role="${pair%%:*}"
+  dir="${pair#*:}"
+
+  [ -d "$dir" ] || fail "$role checkout not found: $dir"
+  [ -f "$dir/config/environment.rb" ] || fail "$role checkout is not a Rails app: $dir"
+
+  branch="$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '(not a git repo)')"
+  dirty=""
+  [ -n "$(git -C "$dir" status --porcelain 2>/dev/null)" ] && dirty="  (dirty)"
+
+  note "$(printf '%-9s %s' "$role" "$dir")"
+  note "$(printf '%-9s %s%s' "" "$branch" "$dirty")"
+done
+
+note ""
+note "env       RAILS_ENV=$RAILS_ENV"
+
+# ---------------------------------------------------------------------------
+# Reused snapshots
+#
+# What --only skips. Checked here, in dry-run too: it is all reads, and it is
+# the difference between "the main side is nine days old" and a report header
+# that looks exactly like a fresh one.
+# ---------------------------------------------------------------------------
+
+if [ "${#REUSED[@]}" -gt 0 ]; then
+  step "Reusing snapshots  (--only $ONLY)"
+
+  for label in "${REUSED[@]}"; do
+    reused_file="$SNAPSHOT_DIR/$label.json"
+
+    [ -f "$reused_file" ] || fail "$label: no snapshot at $reused_file.
+   --only $ONLY reuses this snapshot for the reports but does not build it.
+   Run local/refresh-all once to build both branches."
+
+    case "$label" in
+      *-noeager) reused_want=false ;;
+      *)         reused_want=true  ;;
+    esac
+
+    reused_got="$(snapshot_eager "$reused_file")"
+
+    # The same guard a fresh snapshot gets, for the same reason: a pair whose
+    # two sides were booted in the same mode compares cleanly while measuring
+    # nothing.
+    if [ "$reused_got" != "$reused_want" ]; then
+      fail "$label: reused snapshot recorded eager_load=$reused_got, expected $reused_want.
+   Its pair in this run is booted with eager_load=$reused_want, so every
+   difference between them would be the mode, not the branch.
+   Rebuild it with local/refresh-all."
+    fi
+
+    note "$(printf '%-16s v%-3s eager_load=%-5s built %s' \
+      "$label" \
+      "$(snapshot_version "$reused_file" 2>/dev/null || echo '?')" \
+      "$reused_got" \
+      "$(date -r "$reused_file" '+%Y-%m-%d %H:%M')")"
+  done
+
+  note ""
+  note "not re-snapshotted -- run local/refresh-all to rebuild both branches"
+fi
+
+# ---------------------------------------------------------------------------
+# Self-test -- seconds, and it guards the scripts the next twenty minutes use
+# ---------------------------------------------------------------------------
+
+if [ "${SKIP_SELFTEST:-0}" = "1" ]; then
+  step "Self-test (skipped)"
+else
+  step "Self-test"
+  run "$REPO/runtime-snapshot/test/selftest.sh"
+fi
+
+# ---------------------------------------------------------------------------
+# Rename map
+#
+# Reused rather than rebuilt, by choice -- but a stale map is the documented
+# cause of a large bogus method_relocations count, so its age is printed every
+# run instead of being left to be remembered.
+# ---------------------------------------------------------------------------
+
+step "Rename map"
+
+RENAMES="$SNAPSHOT_DIR/renames.json"
+
+if [ "${REFRESH_RENAMES:-0}" = "1" ]; then
+  RENAME_BASE="${RENAME_BASE:-$(git -C "$MAIN_APP" rev-parse --abbrev-ref HEAD)}"
+  note "rebuilding against $RENAME_BASE"
+  run "$BIN/renames" "$ZW_APP" "$RENAME_BASE"
+elif [ -f "$RENAMES" ]; then
+  note "reusing $RENAMES"
+  note "$(ruby -rjson -e 'puts "#{JSON.parse(File.read(ARGV[0]))["rename_count"]} renames"' "$RENAMES" 2>/dev/null || echo 'unreadable')"
+  note "last built $(date -r "$RENAMES" '+%Y-%m-%d %H:%M')  -- REFRESH_RENAMES=1 to rebuild"
+else
+  note "none found; the reports will flag renamed files as removed-and-added"
+fi
+
+# ---------------------------------------------------------------------------
+# Snapshots
+#
+# Sequential. The two modes of one checkout share tmp/ and the Bootsnap cache,
+# so they could not overlap anyway.
+# ---------------------------------------------------------------------------
+
+snapshot() { # app-dir label eager|noeager
+  local app="$1" label="$2" mode="$3"
+  local want env_value out started
+
+  # The mode is a word, not the value of EAGER_LOAD_APP, and `want` comes from
+  # the mode rather than from the value. That separation is the only reason the
+  # check below can catch anything: when both were derived from the same token,
+  # changing the spelling development.rb expects moved the expectation with it,
+  # so four non-eager snapshots agreed with themselves and the guard never fired.
+  case "$mode" in
+    eager)   env_value=true;  want=true  ;;
+    noeager) env_value=false; want=false ;;
+    *)       fail "snapshot: mode must be 'eager' or 'noeager', got '$mode'" ;;
+  esac
+
+  out="$SNAPSHOT_DIR/$label.json"
+
+  step "Snapshot $label  (eager_load=$want)"
+  started=$SECONDS
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '   + EAGER_LOAD_APP=%s %s %s %s\n' "$env_value" "$BIN/snapshot" "$app" "$label"
+    return
+  fi
+
+  EAGER_LOAD_APP="$env_value" "$BIN/snapshot" "$app" "$label"
+
+  # bin/snapshot's own eager echo greps for a literal `config.eager_load =`, so
+  # with the value coming from ENV it can only print the expression. This is the
+  # check that means anything: if development.rb ignored the variable, all four
+  # snapshots would come out in one mode -- and the pair would compare cleanly
+  # while measuring nothing, which is worse than an error.
+  local got
+  got="$(snapshot_eager "$out")"
+
+  if [ "$got" != "$want" ]; then
+    fail "$label: asked for eager_load=$want but the snapshot recorded $got.
+   EAGER_LOAD_APP=$env_value did not reach config.eager_load in $app.
+   config/environments/$RAILS_ENV.rb should read:
+     config.eager_load = ENV['EAGER_LOAD_APP'] == \"true\"
+   If you change the spelling it compares against, change env_value above to
+   match -- but leave 'want' alone, or this check stops meaning anything."
+  fi
+
+  note "recorded eager_load=$got, script_version=$(snapshot_version "$out")"
+  elapsed $(( SECONDS - started ))
+}
+
+if [ "$ONLY" != zeitwerk ]; then
+  snapshot "$MAIN_APP" main-eager   eager
+  snapshot "$MAIN_APP" main-noeager noeager
+fi
+
+if [ "$ONLY" != main ]; then
+  snapshot "$ZW_APP" zeitwerk-eager   eager
+  snapshot "$ZW_APP" zeitwerk-noeager noeager
+fi
+
+# ---------------------------------------------------------------------------
+# Reports
+# ---------------------------------------------------------------------------
+
+COMPARE_FAILED=0
+
+compare_pair() { # label-a label-b out-file
+  local a="$1" b="$2" out="$REPO/$3" started status
+
+  step "Compare $a vs $b"
+  started=$SECONDS
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '   + %s %s %s > %s\n' "$BIN/compare" "$a" "$b" "$out"
+    return
+  fi
+
+  # bin/compare exits 2 on a pair it refuses. Losing the second report because
+  # the first was refused would be a bad trade, so this does not abort.
+  if "$BIN/compare" "$a" "$b" > "$out" 2>&1; then
+    note "wrote $out"
+  else
+    # Capture before anything else: an assignment would reset $?.
+    status=$?
+    COMPARE_FAILED=1
+    printf '\033[31m   compare failed (exit %d) -- see %s\033[0m\n' "$status" "$out"
+  fi
+
+  sed -n '1,/semantic total/p' "$out" | sed 's/^/   /'
+  elapsed $(( SECONDS - started ))
+}
+
+compare_pair main-eager   zeitwerk-eager   eager-compare.txt
+compare_pair main-noeager zeitwerk-noeager noeager-compare.txt
+
+# ---------------------------------------------------------------------------
+# Re-entrant loads
+#
+# Per snapshot rather than per pair: "was any file read while it was still being
+# written" is a property of one boot. All four are run because the useful answer
+# is the difference -- a cycle on the zeitwerk side only is one this migration
+# introduced, and one on both is pre-existing.
+#
+# Never fails the run. A finding here is a finding, not a broken refresh, and
+# the four reports above are worth more than a non-zero exit.
+# ---------------------------------------------------------------------------
+
+step "Re-entrant loads"
+
+CYCLES_OUT="$REPO/cycles.txt"
+CYCLES_TOTAL=0
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  for label in "${LABELS[@]}"; do
+    printf '   + %s %s\n' "$BIN/cycles" "$label"
+  done
+  note "combined into $CYCLES_OUT"
+else
+  started=$SECONDS
+  : > "$CYCLES_OUT"
+
+  for label in "${LABELS[@]}"; do
+    # Not aborted on failure: one unreadable snapshot should not cost the other
+    # three their reports.
+    if ! out="$("$BIN/cycles" "$label" 2>&1)"; then
+      printf '\033[31m   %s: cycles failed\033[0m\n' "$label"
+      printf '%s\n' "$out" | sed 's/^/     /'
+      continue
+    fi
+
+    printf '# %s\n\n%s\n\n' "$label" "$out" >> "$CYCLES_OUT"
+
+    # Read off the section heading rather than counting rows. If the report's
+    # format ever drifts this stops matching, which is why the else branch below
+    # is an error and not a zero -- a silent zero here would read as "clean".
+    files="$(printf '%s\n' "$out" | sed -n 's/^## Files read while still loading (\([0-9]*\))$/\1/p')"
+
+    if [ -z "$files" ]; then
+      if printf '%s\n' "$out" | grep -q 'No file was read while it was still loading'; then
+        files=0
+      else
+        fail "cycles: no finding count in $label's report, and no all-clear line either.
+   Its output format has changed and this summary can no longer be trusted.
+   The full report is still in $CYCLES_OUT."
+      fi
+    fi
+
+    CYCLES_TOTAL=$((CYCLES_TOTAL + files))
+
+    suffix=""
+    printf '%s\n' "$out" | grep -q 'refused: sorted' && suffix="   (classic load record unusable: sorted -- snapshot predates script version 13)"
+
+    if [ "$files" -eq 0 ]; then
+      note "$(printf '%-18s clean%s' "$label" "$suffix")"
+    else
+      note "$(printf '%-18s %d file(s) read while still loading%s' "$label" "$files" "$suffix")"
+    fi
+  done
+
+  note ""
+  note "wrote $CYCLES_OUT"
+  elapsed $(( SECONDS - started ))
+fi
+
+# ---------------------------------------------------------------------------
+# Leftovers
+#
+# Listed, never deleted: this script does not remove data it did not create.
+# ---------------------------------------------------------------------------
+
+if [ "$DRY_RUN" -eq 0 ]; then
+  step "Snapshots not written by this run"
+
+  found=0
+  for f in "$SNAPSHOT_DIR"/*.json; do
+    [ -e "$f" ] || continue
+
+    base="$(basename "$f" .json)"
+    case "$base" in
+      renames|*.sources) continue ;;
+    esac
+
+    printf '%s\n' "${LABELS[@]}" | grep -qx "$base" && continue
+
+    found=1
+    note "$(printf '%-24s v%s  %s' "$base" "$(snapshot_version "$f" 2>/dev/null || echo '?')" "$(date -r "$f" '+%Y-%m-%d %H:%M')")"
+  done
+
+  [ "$found" -eq 0 ] && note "(none)"
+fi
+
+step "Done"
+note "eager    $REPO/eager-compare.txt"
+note "noeager  $REPO/noeager-compare.txt"
+note "cycles   $REPO/cycles.txt"
+
+if [ "$DRY_RUN" -eq 0 ] && [ "$CYCLES_TOTAL" -gt 0 ]; then
+  note ""
+  note "$CYCLES_TOTAL file(s) were read while still loading -- see cycles.txt."
+  note "A macro reading a constant from a half-loaded file generates nothing and"
+  note "raises nothing, so this will not appear in the comparison reports."
+fi
+
+elapsed "$SECONDS"
+
+exit "$COMPARE_FAILED"
