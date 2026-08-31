@@ -44,6 +44,7 @@ APP_DIR = File.expand_path(ARGV[0])
 module ActiveSupport
   module Dependencies
     def self.history; @history ||= Set.new; end
+    def self.autoloaded_constants; @autoloaded_constants ||= []; end
   end
 end
 DUMP    = File.expand_path(ARGV[1])
@@ -51,6 +52,13 @@ DUMP    = File.expand_path(ARGV[1])
 module Rails
   Config = Struct.new(:eager_load, :autoloader, :autoload_paths, :eager_load_paths, :autoload_once_paths)
   App = Struct.new(:config)
+  # Both loaders exist on both branches in a real application -- classic leaves
+  # Rails.autoloaders in place with nothing registered, Zeitwerk fills them in.
+  # Stubbed in the runner rather than in one application.rb for the same reason
+  # Dependencies.history is: defining it on one side only makes it a finding.
+  Loader = Struct.new(:unloadable_cpaths)
+  Autoloaders = Struct.new(:main, :once)
+  def self.autoloaders; @autoloaders ||= Autoloaders.new(Loader.new([]), Loader.new([])); end
   def self.root; Pathname.new(APP_DIR); end
   def self.env; "development"; end
   def self.version; "6.1.7"; end
@@ -607,6 +615,13 @@ require_relative "../app/unhook"
 require_relative "../app/inherited"
 require_relative "../app/values"
 require_relative "../lib/decorator"
+# Classic's own record of what const_missing resolved. Widget is managed on both
+# sides; Depot::Crate and Gadget are not managed under zeitwerk, and Gadget is
+# additionally missing from its constants entirely; MetaProbe moves to zeitwerk's
+# once loader, which has to count as managed or it reads as a loss.
+ActiveSupport::Dependencies.autoloaded_constants.concat(
+  %w[Widget Depot::Crate Gadget MetaProbe]
+)
 RUBY
 
 # Same class bodies, re-indented one level (as a namespacing change would do),
@@ -717,6 +732,11 @@ require_relative "../app/prepended_drift"
 require_relative "../app/unhook"
 require_relative "../app/inherited"
 require_relative "../app/values"
+# Zeitwerk's registry is everything the loader set an autoload for, loaded or
+# not. Registered::NeverLoaded is that second half: registered here, defined
+# nowhere, and therefore absent from `constants` on both sides.
+Rails.autoloaders.main.unloadable_cpaths.concat(%w[Widget Registered::NeverLoaded])
+Rails.autoloaders.once.unloadable_cpaths << "MetaProbe"
 RUBY
 
 mkdir -p "$WORK/snap"
@@ -1197,6 +1217,65 @@ ruby -rjson -e 's = JSON.parse(File.read(ARGV[0])); s["counts"]["autoloaded"] = 
 
 assert_eq "and one without it warns" \
   "1" "$(compare nohistory zeitwerk | grep -c '^!  warning: classic: classic autoloader')"
+
+echo
+echo "-- autoload registry --"
+
+# Which constants each autoloader considers its own. Nothing else in the snapshot
+# answers that, so a constant that stops being managed compares clean everywhere
+# else and only shows up as an edit that stops taking effect in development.
+registry_rows() { compare classic zeitwerk --format json \
+  | ruby -rjson -e 'puts JSON.generate(JSON.parse($stdin.read)[ARGV[0]])' "$1"; }
+
+has_row() { # section constant
+  ruby -rjson -e 'puts JSON.parse(ARGV[0]).include?(ARGV[1])' "$(registry_rows "$1")" "$2"
+}
+
+assert_eq "classic's constant record is captured" \
+  "true" \
+  "$(ruby -rjson -e 'puts JSON.parse(File.read(ARGV[0]))["counts"]["autoloaded_constants"].to_i.positive?' "$WORK/snap/classic.json")"
+
+assert_eq "zeitwerk's loader registry is captured" \
+  "true" \
+  "$(ruby -rjson -e 'puts JSON.parse(File.read(ARGV[0]))["counts"]["unloadable_main"].to_i.positive?' "$WORK/snap/zeitwerk.json")"
+
+# The false-positive guard: managed on both sides is the normal case and must be
+# silent, or the section is one row per application constant.
+assert_eq "a constant both autoloaders manage is not reported" \
+  "false false" \
+  "$(has_row autoload_managed_only_a Widget) $(has_row autoload_managed_only_b Widget)"
+
+assert_eq "a constant only classic autoloaded is reported" \
+  "true" "$(has_row autoload_managed_only_a Depot::Crate)"
+
+assert_eq "a constant zeitwerk registered but never loaded is reported" \
+  "true" "$(has_row autoload_managed_only_b Registered::NeverLoaded)"
+
+# The once loader manages autoload_once_paths. Leaving it out of the union would
+# report everything it holds as no longer managed.
+assert_eq "the once loader counts as managed" \
+  "false" "$(has_row autoload_managed_only_a MetaProbe)"
+
+# Two annotations, because "absent from B" has two very different causes and the
+# row is unreadable without knowing which.
+assert_eq "a row that is also a constants_missing finding says so" \
+  "1" "$(compare classic zeitwerk | grep -c '^  Gadget   (also in constants_missing)$')"
+
+assert_eq "a registered-but-unloaded row says so" \
+  "1" "$(compare classic zeitwerk | grep -c '^  Registered::NeverLoaded   (registered, not loaded)$')"
+
+# An empty registry compares clean against anything, so it has to be loud -- the
+# same silent degradation as a missing Dependencies.history.
+assert_eq "a snapshot with a registry does not warn" \
+  "0" "$(compare classic zeitwerk | grep -c 'registered no constants at all')"
+
+ruby -rjson -e 's = JSON.parse(File.read(ARGV[0]))
+                %w[autoloaded_constants unloadable_main unloadable_once].each { |k| s["counts"][k] = 0 }
+                File.write(ARGV[1], JSON.generate(s))' \
+  "$WORK/snap/classic.json" "$WORK/snap/noregistry.json"
+
+assert_eq "and one without it warns" \
+  "1" "$(compare noregistry zeitwerk | grep -c '^!  warning: classic: the autoloader registered no constants')"
 
 if [ "$FILES_MAP" -lt "$FILES_NO_MAP" ]; then
   ok "the rename map collapses a moved file ($FILES_NO_MAP -> $FILES_MAP)"

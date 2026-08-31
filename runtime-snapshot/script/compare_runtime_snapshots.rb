@@ -873,6 +873,39 @@ files_only_a = (set_a - set_b).reject { |f| IGNORE.file?(f) }.sort
 files_only_b = (set_b - set_a).reject { |f| IGNORE.file?(f) }.sort
 
 # ---------------------------------------------------------------------------
+# Autoload ownership
+#
+# Which constants each branch's autoloader considers its own -- classic's
+# autoloaded_constants against Zeitwerk's unloadable_cpaths. A constant that was
+# autoload-managed in A and is not in B still exists, still has the same
+# ancestors and still owns the same methods: it compares clean in every section
+# above. What changed is that nothing will unload it, which in development is the
+# difference between an edit taking effect and not.
+#
+# Unioned per snapshot rather than paired list against list. Only one of the
+# three lists is ever populated on a given branch, so the union IS classic's
+# record diffed against Zeitwerk's registry -- and it stays correct for a
+# same-branch noise-floor run, where pairing by list name would diff a populated
+# list against an empty one and report the whole application.
+# ---------------------------------------------------------------------------
+
+def autoload_managed_set(snapshot)
+  registry = snapshot.fetch("autoload_registry", {})
+
+  (Array(registry["autoloaded_constants"]) +
+   Array(registry["unloadable_main"]) +
+   Array(registry["unloadable_once"])).to_set
+end
+
+managed_a = autoload_managed_set(snapshot_a)
+managed_b = autoload_managed_set(snapshot_b)
+
+# The same "constant" rule kind the constants sections use, so a name already
+# triaged there does not have to be triaged twice.
+autoload_only_a = (managed_a - managed_b).reject { |n| IGNORE.constant?(n) }.sort
+autoload_only_b = (managed_b - managed_a).reject { |n| IGNORE.constant?(n) }.sort
+
+# ---------------------------------------------------------------------------
 # Counts and exit status
 # ---------------------------------------------------------------------------
 
@@ -892,7 +925,9 @@ counts = {
   "visibility_changes" => visibility_changes.length,
   "signature_diffs" => signature_changes.length,
   "files_only_a" => files_only_a.length,
-  "files_only_b" => files_only_b.length
+  "files_only_b" => files_only_b.length,
+  "autoload_managed_only_a" => autoload_only_a.length,
+  "autoload_managed_only_b" => autoload_only_b.length
 }
 
 # Semantic sections describe the runtime state itself, which is what has to
@@ -916,9 +951,19 @@ SEMANTIC_SECTIONS = %w[
 # real difference that is very unlikely to be a regression -- and there are an
 # order of magnitude more of them. Keeping them out of the semantic total is what
 # lets the membership changes be seen.
+#
+# autoload_managed_* is here for a different reason than the rest: the two sides
+# do not measure the same population. Classic's list is what const_missing
+# actually resolved; Zeitwerk's is everything the loader registered an autoload
+# for, loaded or not. In the non-eager pair that makes only_b the whole tree
+# against the handful of constants boot touched, and putting thousands of such
+# rows in the semantic total would bury the number the convergence loop exists to
+# drive to zero. only_a is the direction worth reading, and it is visible in the
+# header either way.
 INFORMATIONAL_SECTIONS = %w[
   class_attribute_order_only constant_value_order_only resolution_super_only
   attribute_ownership_only files_only_a files_only_b
+  autoload_managed_only_a autoload_managed_only_b
 ].freeze
 
 semantic_total = SEMANTIC_SECTIONS.sum { |k| IGNORE.section?(k) ? 0 : counts[k] }
@@ -953,7 +998,7 @@ end
 # Keep in step with SCRIPT_VERSION in dump_runtime_snapshot.rb. The mismatch
 # check above only catches a mixed pair; two equally stale snapshots would
 # compare cleanly and quietly reproduce whatever the old dumper got wrong.
-EXPECTED_SCRIPT_VERSION = 14
+EXPECTED_SCRIPT_VERSION = 15
 
 if id_a["script_version"] == id_b["script_version"] &&
    id_a["script_version"].to_i < EXPECTED_SCRIPT_VERSION
@@ -979,6 +1024,28 @@ end
   warnings << "#{label}: classic autoloader, but no ActiveSupport::Dependencies.history " \
               "was captured. Files it loaded with Kernel#load are invisible, so the " \
               "files_only_* sections under-report. Re-snapshot with script version 12+."
+end
+
+# An autoloader that registered nothing degrades the same way: an empty set
+# compares clean against anything, so the section reports no findings rather than
+# reporting that it could not look. Classic only fills autoloaded_constants while
+# Dependencies.mechanism is :load -- with cache_classes = true it requires rather
+# than loads and records nothing -- and Zeitwerk only fills to_unload when
+# reloading is enabled. Gated on the key being present so a pre-15 snapshot gets
+# the script-version warning instead of this one as well.
+[[snapshot_a, label_a], [snapshot_b, label_b]].each do |snapshot, label|
+  next unless snapshot.key?("autoload_registry")
+
+  counted = snapshot.fetch("counts", {})
+                    .values_at("autoloaded_constants", "unloadable_main", "unloadable_once")
+                    .compact.sum
+
+  next if counted.positive?
+
+  warnings << "#{label}: the autoloader registered no constants at all. Either " \
+              "cache_classes is on, so classic requires rather than loads and keeps no " \
+              "record, or Zeitwerk reloading is disabled. The autoload_managed_* " \
+              "sections are comparing an empty set."
 end
 
 if id_a["bootsnap_active"] != id_b["bootsnap_active"]
@@ -1034,7 +1101,9 @@ if options[:format] == "json"
     "visibility_changes" => visibility_changes,
     "signature_diffs" => signature_changes,
     "files_only_a" => files_only_a,
-    "files_only_b" => files_only_b
+    "files_only_b" => files_only_b,
+    "autoload_managed_only_a" => autoload_only_a,
+    "autoload_managed_only_b" => autoload_only_b
   )
 
   exit(options[:exit_code] && (semantic_total.positive? || (options[:strict] && informational_total.positive?)) ? 1 : 0)
@@ -1299,6 +1368,35 @@ end
 
 section("files_only_b", "Files loaded in #{label_b} only", files_only_b) do |file|
   puts "  #{file}"
+end
+
+# Absent from B's constants does not on its own mean the constant is gone -- it
+# can equally mean it was never in scope. Saying which keeps the row from being
+# read as a second copy of a finding that is already above.
+def managed_note_a(name)
+  return "" if CONSTANTS_B.key?(name)
+  return "   (also in constants_missing)" if CONSTANTS_A.key?(name)
+
+  "   (not captured on either side)"
+end
+
+section("autoload_managed_only_a", "Autoload-managed in #{label_a} only", autoload_only_a,
+        note: "The autoloader's own record of what it will unload on reload: classic's " \
+              "autoloaded_constants against Zeitwerk's unloadable_cpaths. A constant here " \
+              "that still exists in #{label_b} compares clean everywhere else -- same " \
+              "ancestors, same methods -- but nothing unloads it any more, so an edit to " \
+              "its file stops taking effect in development. This is the direction worth " \
+              "reading.") do |name|
+  puts "  #{name}#{managed_note_a(name)}"
+end
+
+section("autoload_managed_only_b", "Autoload-managed in #{label_b} only", autoload_only_b,
+        note: "Expected to be large, and not a worklist. Zeitwerk registers an autoload " \
+              "for every file it manages whether or not anything loads it, while classic " \
+              "only records what const_missing actually resolved -- so in the non-eager " \
+              "pair this is most of the application. Rows marked \"registered, not " \
+              "loaded\" are exactly that difference.") do |name|
+  puts "  #{name}#{CONSTANTS_B.key?(name) ? '' : '   (registered, not loaded)'}"
 end
 
 

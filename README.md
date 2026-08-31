@@ -8,7 +8,7 @@ none of which necessarily raises an error.
 
 | Directory | What it does |
 | --- | --- |
-| `runtime-snapshot/` | Captures and diffs the full runtime state of a booted app: load order, constants, ancestors, methods, method source. **Start here.** |
+| `runtime-snapshot/` | Captures and diffs the full runtime state of a booted app: load order, constants, ancestors, methods, method source, and what each autoloader claims to own. **Start here.** |
 | `facility-settings/` | Behavioral spot-check: reads Facility/Company settings both ways and prints them for eyeballing. |
 | `source-trace/` | Minimal `TracePoint(:line)` trace of which app files execute during boot + eager load. |
 

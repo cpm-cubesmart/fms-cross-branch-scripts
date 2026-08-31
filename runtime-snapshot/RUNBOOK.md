@@ -458,6 +458,8 @@ original definition. No error is raised. The method silently reverts.
 | `constant_value_order_only` | A constant hash has the same keys and the same values in a different insertion order. Ruby preserves hash order, so `#each` and `#first` see it — but a constant hash built by iterating something that follows load order reorders for reasons unrelated to behaviour. One gem constant produced three different digests across four snapshots with identical contents, two of them from the same branch. |
 | `resolution_super_only` | The same definition still wins the call; only what `super` walks moved. Inert unless the winner calls `super`. |
 | `files_only_a` / `files_only_b` | A file was loaded on one branch only, judged by the union of `$LOADED_FEATURES`, the class-body trace, and classic's `Dependencies.history` — no single one of those is comparable across autoloaders. Worth scanning — a file in `files_only_a` often explains a `constants_missing` entry. |
+| `autoload_managed_only_a` | The constant was the autoloader's own on the base branch and is not on the Zeitwerk branch. **The direction worth reading.** A row here whose constant still exists in B compares clean in every semantic section — same ancestors, same methods, same values — but nothing unloads it any more, so an edit to its file stops taking effect in development. Rows annotated `(also in constants_missing)` are already reported above and are not a second finding. |
+| `autoload_managed_only_b` | The mirror, and expected to be large. Zeitwerk registers an autoload for every file it manages whether or not anything loads it; classic only records what `const_missing` actually resolved. In the non-eager pair that difference is most of the application, and rows marked `(registered, not loaded)` are exactly it. Scan it for a namespace you did not expect Zeitwerk to own; do not try to drive it to zero. |
 
 ### Exit codes
 
@@ -649,6 +651,8 @@ regardless of where they live or what they are called.
 | `files_only_b` in the thousands with no constant difference | The two sides were measured by different mechanisms. Classic loads app files with `Kernel#load`, which never enters `$LOADED_FEATURES`; Zeitwerk uses `require`, which does. | Snapshots predate script version 12. Re-snapshot; the comparison then unions in classic's own load record. |
 | `files_only_a` roughly equal to `counts.autoloaded` | Every entry in classic's load record became an orphan row. `require_or_load` chomps `.rb` before expanding, so `history` holds extension-less paths while the other two signals hold real filenames. | Fixed in the comparator, which restores the extension before applying the rename map. If it recurs, check `with_extension` still runs ahead of `canonical_path`. |
 | Warning: "classic autoloader, but no ActiveSupport::Dependencies.history" | That leg of the union is missing, so a file that only monkey-patches — no class body, loaded via `load` — is invisible on the classic side. | Re-snapshot with script version 12+. Check `counts.autoloaded` is non-zero on the classic snapshot. |
+| Warning: "the autoloader registered no constants at all" | Neither autoloader recorded anything, so `autoload_managed_*` is comparing an empty set — it reports no findings rather than reporting that it could not look. Classic only fills `autoloaded_constants` while `Dependencies.mechanism` is `:load`; with `cache_classes = true` it requires rather than loads and keeps no record. Zeitwerk only fills `to_unload` when reloading is enabled. | Take the pair in an environment where reloading is on (`cache_classes = false`), which is what §5 and §6 already do. Check `counts.autoloaded_constants` on the base snapshot and `counts.unloadable_main` on the Zeitwerk one. |
+| `autoload_managed_only_b` in the thousands | Expected in the non-eager pair, and not a finding: Zeitwerk's list is a registry of everything it *could* load, classic's is a record of what it *did* load. | Nothing to do — that asymmetry is why the section is informational. Read `autoload_managed_only_a` instead. |
 | Added an ignore rule and the count did not move | The rule did not parse, or it parsed but matched nothing. | Read the `ignore list:` warnings in the header — both cases are reported there with a line number. A `file` rule needs the path exactly as the report prints it, canonicalized through the rename map. |
 | Snapshot run is slow | Expected: it parses every application source file once and reflects over every method. | Nothing to do. It is already ~100x faster than the naive approach; the cost is dominated by application size. |
 
@@ -660,7 +664,7 @@ All under `runtime-snapshot/snapshots/` (gitignored).
 
 | File | Contents |
 | --- | --- |
-| `<label>.json` | The snapshot. Top-level keys: `meta`, `identity`, `paths`, `load_order`, `counts`, `skipped`, `duplicate_names`, `ancestor_methods`, `constants`. Each constant carries `ancestors`, `values` (simple constant values, digested), `class_attributes`, and `methods`. |
+| `<label>.json` | The snapshot. Top-level keys: `meta`, `identity`, `paths`, `load_order`, `autoload_registry`, `counts`, `skipped`, `duplicate_names`, `ancestor_methods`, `constants`. Each constant carries `ancestors`, `values` (simple constant values, digested), `class_attributes`, and `methods`. |
 | `<label>.sources.json` | Method bodies keyed by SHA-256. Nothing in the report reads these — they are there so you can pull up a body by hand when a `~` row is surprising. Only methods defined under `Rails.root`. |
 | `renames.json` | The old → new path map, plus the raw `git diff` records. |
 | `ignore.txt` | Your triage allowlist. Not created automatically. |
@@ -692,7 +696,25 @@ ruby -rjson -e 'JSON.parse(File.read(ARGV[0]))["load_order"]["class_bodies"]
 # first 40 files loaded during boot
 ruby -rjson -e 'puts JSON.parse(File.read(ARGV[0]))["load_order"]["files"].first(40)' \
   runtime-snapshot/snapshots/main-eager.json
+
+# what the autoloader considers its own
+ruby -rjson -e 'puts JSON.parse(File.read(ARGV[0]))["autoload_registry"]' \
+  runtime-snapshot/snapshots/main-eager.json
 ```
+
+`autoload_registry` holds three lists, and only one of them is populated on a
+given branch:
+
+| Key | Source | Order | Counted as |
+| --- | --- | --- | --- |
+| `autoloaded_constants` | `ActiveSupport::Dependencies.autoloaded_constants` — what classic's `const_missing` actually resolved | resolution order, deliberately unsorted | `counts.autoloaded_constants` |
+| `unloadable_main` | `Rails.autoloaders.main.unloadable_cpaths` — everything Zeitwerk registered an autoload for, loaded or not | sorted | `counts.unloadable_main` |
+| `unloadable_once` | `Rails.autoloaders.once.unloadable_cpaths`, backing `config.autoload_once_paths` | sorted | `counts.unloadable_once` |
+
+The comparator unions the three per snapshot and diffs the two sets, so the
+comparison is classic's record against Zeitwerk's registry — see
+`autoload_managed_only_a` / `_only_b` under §8. All three go empty when reloading
+is off, and the comparator warns rather than reporting a clean empty comparison.
 
 ---
 

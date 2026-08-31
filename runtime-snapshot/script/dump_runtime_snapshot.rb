@@ -16,6 +16,7 @@
 #   3. ancestors, in order                    (constants.*.ancestors)
 #   4. methods defined directly on each       (constants.*.methods)
 #   5. the source text of those methods       (source_sha + sources sidecar)
+#   6. what each autoloader claims to own     (autoload_registry)
 #
 # TWO INVARIANTS THIS SCRIPT MUST UPHOLD
 #
@@ -129,7 +130,14 @@ end
 #     negative, since a real change to the class's own body digested as the
 #     module's and compared clean. 20 methods per boot in this app, all of them
 #     the engine-extension prepend pattern the migration is meant to watch.
-SCRIPT_VERSION = 14
+# 15: autoload_registry -- each autoloader's own record of the constants it
+#     manages. Nothing else in the snapshot says which autoloader owns a
+#     constant: `constants` records that one exists and where it was defined,
+#     never who is responsible for unloading it. So a constant classic
+#     autoloaded and Zeitwerk does not manage compared clean in every section
+#     here, right up until the first reload in development -- when it silently
+#     stops being reloaded, or stops being unloaded and goes stale.
+SCRIPT_VERSION = 15
 
 OUT_PATH        = ENV["SNAPSHOT_OUT"]
 SOURCES_PATH    = ENV["SNAPSHOT_SOURCES_OUT"]
@@ -1410,6 +1418,69 @@ script_compiled =
   end
 
 # ---------------------------------------------------------------------------
+# The autoloader's own constant registry
+#
+# Each autoloader keeps a list of the constants it will remove on reload, and it
+# is the only place either one says what it considers ITS OWN. Nothing else in
+# this snapshot can answer that: `constants` records that a constant exists and
+# where it was defined, never who is responsible for unloading it.
+#
+# The two sides are counterparts, not the same measurement:
+#
+#   classic   autoloaded_constants -- what const_missing actually resolved, in
+#             the order it happened. An event record.
+#   zeitwerk  unloadable_cpaths -- everything the loader set an autoload for at
+#             setup time, loaded or not. A registry.
+#
+# Both go empty when reloading is off -- classic uses Kernel#require rather than
+# Kernel#load once Dependencies.mechanism is :require, and Zeitwerk only writes
+# to_unload when enable_reloading has been called -- so an empty list here is a
+# statement about the mode, not about the application. Recorded as empty rather
+# than absent, and warned about by the comparator.
+#
+# Neither call can trigger an autoload: autoloaded_constants is a plain Array,
+# and unloadable_cpaths is to_unload.keys. That is what makes them safe to read
+# from the non-eager snapshot, which is the one invariant this script cannot
+# break -- and it is why they are read directly rather than reconstructed.
+# ---------------------------------------------------------------------------
+
+# Deliberately NOT sorted, for the same reason load_order.autoloaded is not:
+# this is classic's own record of the order const_missing resolved things, and
+# sorting it throws away the only ordering signal the classic side has.
+autoloaded_constants =
+  safe([]) do
+    next [] unless defined?(ActiveSupport::Dependencies)
+    next [] unless ActiveSupport::Dependencies.respond_to?(:autoloaded_constants)
+
+    Array(ActiveSupport::Dependencies.autoloaded_constants).map(&:to_s).uniq
+  end || []
+
+# Feature-detected at every level rather than assumed: Rails.autoloaders does not
+# exist before Rails 6, `once` was not always a reader, and unloadable_cpaths is
+# a Zeitwerk method that a pinned older version may not have. Each of those would
+# otherwise be swallowed by safe{} and reported as an empty registry, which is
+# indistinguishable from reloading being switched off.
+def unloadable_cpaths_for(which)
+  safe([]) do
+    next [] unless defined?(Rails) && Rails.respond_to?(:autoloaders)
+
+    loaders = Rails.autoloaders
+    next [] if loaders.nil? || !loaders.respond_to?(which)
+
+    loader = loaders.public_send(which)
+    next [] if loader.nil? || !loader.respond_to?(:unloadable_cpaths)
+
+    # Sorted, unlike the classic list above. to_unload is keyed in directory scan
+    # order, which is a property of the filesystem rather than a record of
+    # anything the application did, and nothing downstream reads it as a clock.
+    Array(loader.unloadable_cpaths).map(&:to_s).sort
+  end || []
+end
+
+unloadable_main = unloadable_cpaths_for(:main)
+unloadable_once = unloadable_cpaths_for(:once)
+
+# ---------------------------------------------------------------------------
 # Identity -- what the comparator uses to refuse mismatched pairs
 # ---------------------------------------------------------------------------
 
@@ -1487,12 +1558,22 @@ snapshot = {
     "script_compiled" => script_compiled,
     "dropped_class_events" => TRACE ? TRACE[:dropped_class_events] : nil
   },
+  # A sibling of load_order rather than a member of it: these are constants, and
+  # only one of the three is a record of anything happening in order.
+  "autoload_registry" => {
+    "autoloaded_constants" => autoloaded_constants,
+    "unloadable_main" => unloadable_main,
+    "unloadable_once" => unloadable_once
+  },
   "counts" => {
     "constants" => constants.size,
     "methods" => constants.values.sum { |c| c["methods"].length },
     "body_digests" => BODY_DIGEST_COUNT[0],
     "loaded_files" => loaded_files.length,
     "autoloaded" => autoloaded_files.length,
+    "autoloaded_constants" => autoloaded_constants.length,
+    "unloadable_main" => unloadable_main.length,
+    "unloadable_once" => unloadable_once.length,
     "class_bodies" => class_bodies.length,
     "skipped" => skipped.length,
     "duplicate_names" => duplicates.uniq.length,
