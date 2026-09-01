@@ -287,6 +287,13 @@ Zeitwerk eager-loads alphabetically per root directory, so its file ordering
 will never match classic's `require` order. These exist to explain *why* a
 semantic finding happened, not to be driven to zero.
 
+The snake_case id in the tables below is the one token this whole document turns
+on: it is the key in the counts block, it leads the `##` heading of the section
+holding those rows (`## constants_missing (12) -- Constants present in ...`), it
+is the key in `--format json`, and it is what a `section` rule in the ignore file
+takes. Read a number in the counts block, search the report for its id, and you
+are at its rows.
+
 ### Semantic sections
 
 | Section | Non-zero means | Usual fix |

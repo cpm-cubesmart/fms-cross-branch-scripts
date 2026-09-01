@@ -938,6 +938,21 @@ assert_eq "and it appears in the text report, not just the counts" \
 assert_eq "every counted section has a renderer" \
   "" "$(compare classic zeitwerk | grep '^!! BUG' || true)"
 
+# ... and the reader has to be able to get from the count to the rows. The
+# heading leads with the same snake_case id the counts block is keyed by, so a
+# number read up top is a token to search for down here.
+assert_eq "a section heading leads with its id and its count" \
+  "1" "$(compare classic zeitwerk | grep -c '^## constants_missing ([0-9]')"
+
+# The general form: an id in a heading that names nothing in the counts block is
+# decoration rather than a cross-reference. comm -23 lists headings with no
+# counts line, which must be empty.
+heading_ids() { compare classic zeitwerk | sed -n 's/^## \([a-z_][a-z_]*\) (.*/\1/p' | sort -u; }
+counts_ids()  { compare classic zeitwerk | sed -n 's/^  \([a-z_][a-z_]*\)  *[0-9].*/\1/p' | sort -u; }
+
+assert_eq "every heading id is a line in the counts block" \
+  "" "$(comm -23 <(heading_ids) <(counts_ids))"
+
 # A non-symbol filter is recorded by class, so several can share one label and an
 # index lookup returns the same slot for all of them -- "4 -> 4", a move of zero.
 assert_eq "a repeated filter label reports a count, not a null move" \

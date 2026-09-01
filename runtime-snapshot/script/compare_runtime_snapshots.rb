@@ -1179,7 +1179,12 @@ def section(id, title, rows, note: nil)
   return if IGNORE.section?(id)
 
   puts
-  puts "## #{title} (#{rows.length})"
+  # Id first, and the count immediately after it, so a heading stands in the same
+  # relation as its line in the counts block above -- the number you read up
+  # there is what you search for down here, and it is also what RUNBOOK section 8
+  # is keyed by and what a `section <id>` ignore rule takes. The prose stays as
+  # the explanation rather than as the only handle on the section.
+  puts "## #{id} (#{rows.length}) -- #{title}"
   puts "   #{note}" if note
   puts
   emit(rows) { |row| yield row }
