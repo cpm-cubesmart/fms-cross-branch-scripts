@@ -2,7 +2,7 @@
 #
 # Rebuild every snapshot and both comparison reports, end to end.
 #
-#   local/refresh-all [--dry-run] [--only main|zeitwerk]
+#   refresh/refresh-all [--dry-run] [--only main|zeitwerk] [--anonymize]
 #
 # Four Rails boots by default, sequentially: base and Zeitwerk, each in eager
 # and non-eager mode, then two comparison reports and one re-entrant-load
@@ -15,18 +15,29 @@
 # are then reused exactly as they are on disk -- all three reports still cover
 # both branches, because the reports read snapshots, not checkouts. What is
 # reused is listed in preflight with its age and recorded eager_load, since a
-# stale side produces a report that looks perfectly healthy. local/refresh-zeitwerk
+# stale side produces a report that looks perfectly healthy. refresh/refresh-zeitwerk
 # is a wrapper for --only zeitwerk, which is the shape of the RUNBOOK's
 # convergence loop: fix the Zeitwerk branch, re-snapshot it, re-read the reports.
 #
-# Not committed -- the checkout paths below are specific to this machine. Every
-# step delegates to runtime-snapshot/bin/*; there is no snapshot or comparison
-# logic here.
+# Every step delegates to runtime-snapshot/bin/*; there is no snapshot or
+# comparison logic here. The checkout locations come from MAIN_APP and ZW_APP,
+# whose defaults below are one particular machine's.
+#
+# ANONYMIZING
+#
+# --anonymize keeps the checkout paths, branch names and commit SHAs off the
+# terminal and out of the reports' headers, for a run whose output is going to be
+# read somewhere other than this machine. It does NOT redact the findings: a
+# comparison report names constants, methods and application files, because that
+# is what a report is. What it produces to send onward is the pair of
+# *-compare-summary.txt files, which are --summary-only and so have no rows in
+# them at all.
 #
 # Environment:
 #   MAIN_APP          base checkout          (default ~/code/fms)
 #   ZW_APP            Zeitwerk checkout      (default ~/code/fms-worktrees/...)
 #   RAILS_ENV         default development
+#   ANONYMIZE=1       same as --anonymize; exported to every step
 #   SKIP_SELFTEST=1   skip the self-test
 #   REFRESH_RENAMES=1 rebuild snapshots/renames.json before snapshotting
 #   RENAME_BASE       base ref for that rebuild (default: MAIN_APP's branch)
@@ -52,8 +63,19 @@ step() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 note() { printf '   %s\n' "$*"; }
 fail() { printf '\n\033[31m!! %s\033[0m\n' "$*" >&2; exit 1; }
 
-run() {
-  printf '   + %s\n' "$*"
+# The echo is the only place a step's arguments reach the terminal, and a
+# generic helper cannot tell a checkout path from a git ref from a label -- so
+# under --anonymize the caller says what to print in their place. Everything
+# after that first argument is the real command, echoed verbatim otherwise.
+run() { # anon-rendering cmd [args...]
+  local shown="$1"; shift
+
+  if anon; then
+    printf '   + %s %s\n' "$(shortpath "$1")" "$shown"
+  else
+    printf '   + %s\n' "$*"
+  fi
+
   [ "$DRY_RUN" -eq 1 ] || "$@"
 }
 
@@ -78,18 +100,42 @@ snapshot_version() {
 DRY_RUN=0
 ONLY=all              # all | main | zeitwerk
 
-usage() { echo "usage: $(basename "$0") [--dry-run] [--only main|zeitwerk]" >&2; }
+# Exported rather than passed as a flag: bin/snapshot takes positional arguments
+# and forwards nothing, so one variable is the only way to reach every step. The
+# comparator reads it too, so bin/compare needs no argument either.
+ANONYMIZE="${ANONYMIZE:-0}"
+
+usage() { echo "usage: $(basename "$0") [--dry-run] [--only main|zeitwerk] [--anonymize]" >&2; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --dry-run) DRY_RUN=1 ;;
-    --only)    [ $# -ge 2 ] || { usage; exit 2; }; ONLY="$2"; shift ;;
-    --only=*)  ONLY="${1#--only=}" ;;
-    -h|--help) usage; exit 0 ;;
-    *)         usage; exit 2 ;;
+    --dry-run)   DRY_RUN=1 ;;
+    --anonymize) ANONYMIZE=1 ;;
+    --only)      [ $# -ge 2 ] || { usage; exit 2; }; ONLY="$2"; shift ;;
+    --only=*)    ONLY="${1#--only=}" ;;
+    -h|--help)   usage; exit 0 ;;
+    *)           usage; exit 2 ;;
   esac
   shift
 done
+
+export ANONYMIZE
+
+# Says so up front. A run whose output is going somewhere else is a different
+# kind of run, and finding that out from the absence of a path is too subtle.
+anon() { [ "$ANONYMIZE" = "1" ]; }
+
+# Paths into this repository are not the application, but they still carry the
+# operator's home directory and layout -- which is the same kind of fact as a
+# branch name, and the mode is not coherent if one goes and the other stays.
+# Relative to the repository root they are just as usable.
+shortpath() {
+  if anon; then
+    printf '%s' "${1#"$REPO"/}"
+  else
+    printf '%s' "$1"
+  fi
+}
 
 # The two labels this run will boot come from ONLY; the other two are reused
 # from disk. REUSED is built here rather than at the snapshot calls because the
@@ -110,21 +156,39 @@ esac
 # Preflight -- cheap checks before twenty minutes of booting
 # ---------------------------------------------------------------------------
 
-step "Checkouts"
+if anon; then
+  step "Checkouts  (anonymized)"
+  note "paths, branches and SHAs are suppressed; the reports still name constants"
+  note ""
+else
+  step "Checkouts"
+fi
 
 for pair in "base:$MAIN_APP" "zeitwerk:$ZW_APP"; do
   role="${pair%%:*}"
   dir="${pair#*:}"
 
-  [ -d "$dir" ] || fail "$role checkout not found: $dir"
-  [ -f "$dir/config/environment.rb" ] || fail "$role checkout is not a Rails app: $dir"
+  if anon; then
+    [ -d "$dir" ] || fail "$role checkout not found (set MAIN_APP / ZW_APP)"
+    [ -f "$dir/config/environment.rb" ] || fail "$role checkout is not a Rails app"
+  else
+    [ -d "$dir" ] || fail "$role checkout not found: $dir"
+    [ -f "$dir/config/environment.rb" ] || fail "$role checkout is not a Rails app: $dir"
+  fi
 
-  branch="$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '(not a git repo)')"
+  # The dirty flag survives anonymizing. It is a boolean, it says nothing about
+  # the application, and it is the difference between a report that describes a
+  # commit and one that describes an uncommitted working tree.
   dirty=""
   [ -n "$(git -C "$dir" status --porcelain 2>/dev/null)" ] && dirty="  (dirty)"
 
-  note "$(printf '%-9s %s' "$role" "$dir")"
-  note "$(printf '%-9s %s%s' "" "$branch" "$dirty")"
+  if anon; then
+    note "$(printf '%-9s %s%s' "$role" "present" "$dirty")"
+  else
+    branch="$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '(not a git repo)')"
+    note "$(printf '%-9s %s' "$role" "$dir")"
+    note "$(printf '%-9s %s%s' "" "$branch" "$dirty")"
+  fi
 done
 
 note ""
@@ -144,9 +208,9 @@ if [ "${#REUSED[@]}" -gt 0 ]; then
   for label in "${REUSED[@]}"; do
     reused_file="$SNAPSHOT_DIR/$label.json"
 
-    [ -f "$reused_file" ] || fail "$label: no snapshot at $reused_file.
+    [ -f "$reused_file" ] || fail "$label: no snapshot at $(shortpath "$reused_file").
    --only $ONLY reuses this snapshot for the reports but does not build it.
-   Run local/refresh-all once to build both branches."
+   Run refresh/refresh-all once to build both branches."
 
     case "$label" in
       *-noeager) reused_want=false ;;
@@ -162,7 +226,7 @@ if [ "${#REUSED[@]}" -gt 0 ]; then
       fail "$label: reused snapshot recorded eager_load=$reused_got, expected $reused_want.
    Its pair in this run is booted with eager_load=$reused_want, so every
    difference between them would be the mode, not the branch.
-   Rebuild it with local/refresh-all."
+   Rebuild it with refresh/refresh-all."
     fi
 
     note "$(printf '%-16s v%-3s eager_load=%-5s built %s' \
@@ -173,7 +237,7 @@ if [ "${#REUSED[@]}" -gt 0 ]; then
   done
 
   note ""
-  note "not re-snapshotted -- run local/refresh-all to rebuild both branches"
+  note "not re-snapshotted -- run refresh/refresh-all to rebuild both branches"
 fi
 
 # ---------------------------------------------------------------------------
@@ -201,10 +265,14 @@ RENAMES="$SNAPSHOT_DIR/renames.json"
 
 if [ "${REFRESH_RENAMES:-0}" = "1" ]; then
   RENAME_BASE="${RENAME_BASE:-$(git -C "$MAIN_APP" rev-parse --abbrev-ref HEAD)}"
-  note "rebuilding against $RENAME_BASE"
-  run "$BIN/renames" "$ZW_APP" "$RENAME_BASE"
+  if anon; then
+    note "rebuilding against the base checkout's current branch"
+  else
+    note "rebuilding against $RENAME_BASE"
+  fi
+  run '<checkout> <base-ref>' "$BIN/renames" "$ZW_APP" "$RENAME_BASE"
 elif [ -f "$RENAMES" ]; then
-  note "reusing $RENAMES"
+  note "reusing $(shortpath "$RENAMES")"
   note "$(ruby -rjson -e 'puts "#{JSON.parse(File.read(ARGV[0]))["rename_count"]} renames"' "$RENAMES" 2>/dev/null || echo 'unreadable')"
   note "last built $(date -r "$RENAMES" '+%Y-%m-%d %H:%M')  -- REFRESH_RENAMES=1 to rebuild"
 else
@@ -239,7 +307,12 @@ snapshot() { # app-dir label eager|noeager
   started=$SECONDS
 
   if [ "$DRY_RUN" -eq 1 ]; then
-    printf '   + EAGER_LOAD_APP=%s %s %s %s\n' "$env_value" "$BIN/snapshot" "$app" "$label"
+    if anon; then
+      printf '   + EAGER_LOAD_APP=%s %s <checkout> %s\n' \
+        "$env_value" "$(shortpath "$BIN/snapshot")" "$label"
+    else
+      printf '   + EAGER_LOAD_APP=%s %s %s %s\n' "$env_value" "$BIN/snapshot" "$app" "$label"
+    fi
     return
   fi
 
@@ -254,6 +327,8 @@ snapshot() { # app-dir label eager|noeager
   got="$(snapshot_eager "$out")"
 
   if [ "$got" != "$want" ]; then
+    anon && app="the checkout"
+
     fail "$label: asked for eager_load=$want but the snapshot recorded $got.
    EAGER_LOAD_APP=$env_value did not reach config.eager_load in $app.
    config/environments/$RAILS_ENV.rb should read:
@@ -282,26 +357,47 @@ fi
 
 COMPARE_FAILED=0
 
+# The summary is a second invocation rather than a slice of the first report.
+# The `sed` below cuts at "semantic total", which is short of the warnings block,
+# and the warnings are the half of it worth reading -- so that cut cannot produce
+# the summary. --summary-only can: it prints the counts AND the warnings, and
+# stops before the first row. The cost is one more parse of the two snapshots.
+#
+# Named *-compare-summary.txt so the existing "*compare*.txt" line in .gitignore
+# already covers it. A report reaching a commit is exactly the accident this is
+# meant to prevent, and a new ignore rule is one more thing to get wrong.
 compare_pair() { # label-a label-b out-file
-  local a="$1" b="$2" out="$REPO/$3" started status
+  local a="$1" b="$2" out="$REPO/$3" summary started status
+
+  summary="${out%.txt}-summary.txt"
 
   step "Compare $a vs $b"
   started=$SECONDS
 
   if [ "$DRY_RUN" -eq 1 ]; then
-    printf '   + %s %s %s > %s\n' "$BIN/compare" "$a" "$b" "$out"
+    printf '   + %s %s %s > %s\n' "$(shortpath "$BIN/compare")" "$a" "$b" "$(shortpath "$out")"
+    printf '   + %s %s %s --summary-only > %s\n' \
+      "$(shortpath "$BIN/compare")" "$a" "$b" "$(shortpath "$summary")"
     return
   fi
 
   # bin/compare exits 2 on a pair it refuses. Losing the second report because
   # the first was refused would be a bad trade, so this does not abort.
   if "$BIN/compare" "$a" "$b" > "$out" 2>&1; then
-    note "wrote $out"
+    note "wrote $(shortpath "$out")"
   else
     # Capture before anything else: an assignment would reset $?.
     status=$?
     COMPARE_FAILED=1
-    printf '\033[31m   compare failed (exit %d) -- see %s\033[0m\n' "$status" "$out"
+    printf '\033[31m   compare failed (exit %d) -- see %s\033[0m\n' "$status" "$(shortpath "$out")"
+  fi
+
+  # Written even when the comparison was refused: a refusal explains itself in
+  # the header, which is precisely what the summary holds.
+  if "$BIN/compare" "$a" "$b" --summary-only > "$summary" 2>&1; then
+    note "wrote $(shortpath "$summary")"
+  else
+    note "wrote $(shortpath "$summary")  (comparison was refused; the reason is in it)"
   fi
 
   sed -n '1,/semantic total/p' "$out" | sed 's/^/   /'
@@ -330,9 +426,9 @@ CYCLES_TOTAL=0
 
 if [ "$DRY_RUN" -eq 1 ]; then
   for label in "${LABELS[@]}"; do
-    printf '   + %s %s\n' "$BIN/cycles" "$label"
+    printf '   + %s %s\n' "$(shortpath "$BIN/cycles")" "$label"
   done
-  note "combined into $CYCLES_OUT"
+  note "combined into $(shortpath "$CYCLES_OUT")"
 else
   started=$SECONDS
   : > "$CYCLES_OUT"
@@ -359,7 +455,7 @@ else
       else
         fail "cycles: no finding count in $label's report, and no all-clear line either.
    Its output format has changed and this summary can no longer be trusted.
-   The full report is still in $CYCLES_OUT."
+   The full report is still in $(shortpath "$CYCLES_OUT")."
       fi
     fi
 
@@ -376,7 +472,7 @@ else
   done
 
   note ""
-  note "wrote $CYCLES_OUT"
+  note "wrote $(shortpath "$CYCLES_OUT")"
   elapsed $(( SECONDS - started ))
 fi
 
@@ -408,9 +504,19 @@ if [ "$DRY_RUN" -eq 0 ]; then
 fi
 
 step "Done"
-note "eager    $REPO/eager-compare.txt"
-note "noeager  $REPO/noeager-compare.txt"
-note "cycles   $REPO/cycles.txt"
+note "eager    $(shortpath "$REPO/eager-compare.txt")"
+note "noeager  $(shortpath "$REPO/noeager-compare.txt")"
+note "cycles   $(shortpath "$REPO/cycles.txt")"
+note ""
+note "to send onward -- counts and warnings, no rows:"
+note "         $(shortpath "$REPO/eager-compare-summary.txt")"
+note "         $(shortpath "$REPO/noeager-compare-summary.txt")"
+
+if ! anon; then
+  note ""
+  note "those two carry this machine's branch names and SHAs; re-run with"
+  note "--anonymize if they are going somewhere else."
+fi
 
 if [ "$DRY_RUN" -eq 0 ] && [ "$CYCLES_TOTAL" -gt 0 ]; then
   note ""

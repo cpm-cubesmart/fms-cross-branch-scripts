@@ -3,5 +3,6 @@ runtime-snapshot/snapshots/
 *compare*.txt
 cycles*.txt
 
-# Machine-specific driver scripts -- they hardcode checkout paths.
+# The driver scripts now live in refresh/ and are committed; MAIN_APP and ZW_APP
+# override their defaults. local/ stays ignored for anything still machine-bound.
 local/

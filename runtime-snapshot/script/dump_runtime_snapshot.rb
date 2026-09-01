@@ -145,6 +145,12 @@ LABEL           = ENV["SNAPSHOT_LABEL"] || "snapshot"
 CAPTURE_SOURCES = ENV.fetch("SNAPSHOT_SOURCE_TEXT", "1") == "1"
 INCLUDE_ANON    = ENV.fetch("SNAPSHOT_INCLUDE_ANONYMOUS", "0") == "1"
 
+# Keeps checkout paths out of what this script prints, for a boot whose terminal
+# output is going to be read off this machine. It does not touch the snapshot,
+# which still records identity.root, identity.branch and identity.sha -- see the
+# comparator's --anonymize, and "What is safe to share" in the RUNBOOK.
+ANONYMIZE       = ENV["ANONYMIZE"] == "1"
+
 ROOT = Rails.root.to_s.freeze
 ROOT_PREFIX = "#{ROOT}/"
 
@@ -1526,9 +1532,18 @@ identity = {
 }
 
 if TRACE && TRACE[:presumed_root] != ROOT
-  warn "[snapshot] WARNING: preboot hook assumed root #{TRACE[:presumed_root].inspect} " \
-       "but Rails.root is #{ROOT.inspect}. Class-body trace data is likely incomplete " \
-       "(run bin/rails from the application directory)."
+  # The two roots are the whole content of this warning and both are absolute
+  # checkout paths. What the reader acts on is that they disagreed and how to
+  # fix it, and neither of those needs the paths.
+  warn(if ANONYMIZE
+         "[snapshot] WARNING: the preboot hook assumed a different root than " \
+         "Rails.root. Class-body trace data is likely incomplete " \
+         "(run bin/rails from the application directory)."
+       else
+         "[snapshot] WARNING: preboot hook assumed root #{TRACE[:presumed_root].inspect} " \
+         "but Rails.root is #{ROOT.inspect}. Class-body trace data is likely incomplete " \
+         "(run bin/rails from the application directory)."
+       end)
 end
 
 paths = {

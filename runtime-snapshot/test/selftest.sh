@@ -1421,6 +1421,78 @@ assert_eq "a # inside a method rule survives comment stripping" \
   "0" "$(warnings_for "$WORK/ignore-hash.txt" | grep -c 'matched nothing')"
 
 echo
+echo "-- anonymize --"
+
+# --anonymize redacts the identity of the machine and the checkouts, never the
+# findings. What it is FOR is a run whose output leaves this machine, and the
+# artifact that produces is --anonymize together with --summary-only.
+
+# The fixture apps are not git repositories, so identity.branch and identity.sha
+# come out nil and a header assertion would pass against nothing. Planted, the
+# way the eager_load and script-version guards are.
+ruby -rjson -e 's = JSON.parse(File.read(ARGV[0]))
+                s["identity"]["branch"] = "topsecret-branch"
+                s["identity"]["sha"] = "deadbeefcafe1234"
+                File.write(ARGV[1], JSON.generate(s))' \
+  "$WORK/snap/classic.json" "$WORK/snap/identified.json"
+
+# Asserted in both directions: without the negative case the positive one would
+# also pass against a header that stopped being rendered at all.
+assert_eq "the header names the branch and SHA by default" \
+  "1" "$(compare identified zeitwerk | grep -c 'topsecret-branch @ deadbeefca')"
+
+assert_eq "and --anonymize drops both" \
+  "0" "$(compare identified zeitwerk --anonymize | grep -c 'topsecret-branch\|deadbeefca')"
+
+# The labels are how you tell the two sides apart. Dropping them would make the
+# report unreadable rather than anonymous.
+assert_eq "the labels survive --anonymize" \
+  "1" "$(compare identified zeitwerk --anonymize | grep -c '^  A (base):     classic$')"
+
+anon_warnings_for() { # ignore-file
+  compare classic zeitwerk --format json --anonymize --ignore "$1" \
+    | ruby -rjson -e 'puts JSON.parse($stdin.read)["warnings"].grep(/ignore list/).join("\n")'
+}
+
+# An ignore rule is a glob written over application constant names, and it used
+# to ride out in a warning that --summary-only keeps.
+assert_eq "an unused rule is counted, not quoted" \
+  "1 0" \
+  "$(anon_warnings_for "$WORK/ignore-unused.txt" | grep -c 'rule(s) matched nothing$') $(anon_warnings_for "$WORK/ignore-unused.txt" | grep -c 'Nonexistent::Thing')"
+
+# Same for a malformed rule: the message quotes the line's first token, which is
+# as likely as not a constant name. The line number is what survives, because it
+# is what you act on and it says nothing.
+assert_eq "a malformed rule keeps its line number and loses its text" \
+  "1 0" \
+  "$(anon_warnings_for "$WORK/ignore-typo.txt" | grep -c 'malformed rule(s) at line(s) 1, 2') $(anon_warnings_for "$WORK/ignore-typo.txt" | grep -c 'constnat')"
+
+# The third leak: an A -> B, B -> C shuffle is reported by path.
+ruby -rjson -e 'File.write(ARGV[0], JSON.generate(
+  "old_to_new" => { "app/a.rb" => "app/b.rb", "app/b.rb" => "app/c.rb" }))' \
+  "$WORK/renames-ambiguous.json"
+
+ambiguous() { compare classic zeitwerk --renames "$WORK/renames-ambiguous.json" "$@" \
+  | grep '^!  warning: 1 path'; }
+
+assert_eq "an ambiguous rename is named by default" \
+  "1" "$(ambiguous | grep -c 'app/b.rb')"
+
+assert_eq "and counted without its path under --anonymize" \
+  "1 0" "$(ambiguous --anonymize | grep -c 'uncanonicalized$') $(ambiguous --anonymize | grep -c 'app/b.rb')"
+
+# The claim the whole mode rests on. --summary-only removes the rows,
+# --anonymize removes what is left, and neither does the other's job.
+assert_eq "--anonymize --summary-only carries nothing from the application" \
+  "0" \
+  "$(compare classic zeitwerk --anonymize --summary-only | grep -c 'Widget\|Gadget\|Depot\|MetaProbe\|app/')"
+
+# ... and the counts are still there, or it would be safe and useless.
+assert_eq "while still reporting the counts" \
+  "1" \
+  "$(compare classic zeitwerk --anonymize --summary-only | grep -c '^  semantic total: [0-9]')"
+
+echo
 echo "-- hostile introspection --"
 
 mkdir -p "$WORK/hostile/config" "$WORK/hostile/app"

@@ -567,6 +567,7 @@ Everything after the two labels is passed through to the comparator. It supplies
 | `--include-generated-ancestors` | Keep Rails' `Generated{Attribute,Association}Methods` in ancestor chains. Collapsed by default, because whether ActiveRecord has generated them yet is a timing artifact rather than a load-order fact. |
 | `--include-autoloader-shims` | Keep the `load` / `require` / `const_missing` resolution rows that `Dependencies.unhook!` produces. Collapsed by default: turning classic autoloading off is implemented by defining those methods directly on `Object` and `Module` to shadow the classic hooks, which every class in the application then sees. |
 | `--include-zeitwerk-shims` | Keep `ActiveSupport::Dependencies::ZeitwerkIntegration::*` in ancestor chains. Collapsed by default: `take_over` does `Object.prepend(RequireDependency)`, so on the zeitwerk side it appears in every `Object`-descended chain and every singleton chain — one mode-switch fact re-reported once per constant, and the mode is already asserted from `identity`. |
+| `--anonymize` | Omit branch, SHA and checkout paths from the header and from the three warnings that quote application-derived strings. **It does not redact the findings** — see §13. Also honoured as `ANONYMIZE=1`, which `bin/snapshot` and `refresh/refresh-all` read too. |
 | `--renames PATH` | Override the auto-detected rename map. |
 | `--ignore PATH` | Override the auto-detected ignore list. |
 | `-h`, `--help` | Full option list. |
@@ -715,6 +716,39 @@ The comparator unions the three per snapshot and diffs the two sets, so the
 comparison is classic's record against Zeitwerk's registry — see
 `autoload_managed_only_a` / `_only_b` under §8. All three go empty when reloading
 is off, and the comparator warns rather than reporting a clean empty comparison.
+
+### What is safe to share
+
+The application is developed on one machine and this tooling on another, so the
+question "can this output leave the machine" has a real answer. There are two
+separate kinds of thing in a report, and **two different switches remove them**:
+
+| | What it is | Removed by |
+| --- | --- | --- |
+| Machine and checkout identity | absolute checkout paths, branch names, commit SHAs; the ambiguous-rename list (application file paths) and the ignore-rule lists (globs over application constant names), both of which survive `--summary-only` | `--anonymize` / `ANONYMIZE=1` |
+| The findings | every constant, method and application file the report names — the substance of every section | `--summary-only`, which prints no rows at all |
+
+Neither does the other's job. An anonymized full report still names constants on
+every line; a `--summary-only` report with no `--anonymize` still carries the
+branch and SHA in its first two lines. **The artifact that is safe to hand
+onward is both together**, and that is exactly what
+`refresh/refresh-all` writes as `eager-compare-summary.txt` and
+`noeager-compare-summary.txt`.
+
+Also worth knowing:
+
+- The snapshot JSON is not shareable under any flag. It is a complete inventory
+  of the application's constants, methods and files — far more than a report.
+  `--anonymize` is about terminal and report output; the dumper still records
+  `identity.branch`, `identity.sha` and `identity.root` in the file.
+- `counts.skipped` is a number and is safe. The `skipped` array holds constant
+  names and is not.
+- `cycles.txt` names application files throughout. `bin/cycles` has no
+  anonymized mode; its **Coverage** block at the end is pure numbers, and that is
+  the part worth quoting.
+- The safe pair is the text format only. `--format json` renders and exits before
+  `--summary-only` is consulted, so `--anonymize --summary-only --format json`
+  still emits every findings array in full.
 
 ---
 

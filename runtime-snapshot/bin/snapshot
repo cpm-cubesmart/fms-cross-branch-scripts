@@ -20,6 +20,29 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_DIR="$HERE/../script"
 SNAPSHOT_DIR="${SNAPSHOT_DIR:-$HERE/../snapshots}"
 
+# Suppresses what identifies the machine and the checkout -- the path and the
+# branch -- and nothing else. The snapshot JSON still records both in its
+# identity block; this is about what lands on the terminal.
+ANONYMIZE="${ANONYMIZE:-0}"
+REPO="$(cd "$HERE/../.." && pwd)"
+
+# A path into this repository is not the application, but it still carries the
+# operator's home directory and layout, which is the same kind of fact as a
+# branch name. Relative to the repository root it is just as usable. SNAPSHOT_DIR
+# can be pointed outside the repository, and then there is nothing to strip and
+# the label is all that can safely be said.
+shortpath() {
+  local rel
+
+  if [ "$ANONYMIZE" != "1" ]; then
+    printf '%s' "$1"
+    return
+  fi
+
+  rel="${1#"$REPO"/}"
+  if [ "$rel" = "$1" ]; then printf '%s' '(in $SNAPSHOT_DIR)'; else printf '%s' "$rel"; fi
+}
+
 if [ $# -lt 2 ]; then
   cat >&2 <<USAGE
 Usage: $(basename "$0") <app-dir> <label>
@@ -29,6 +52,8 @@ Usage: $(basename "$0") <app-dir> <label>
 
 Environment:
   RAILS_ENV                 defaults to development
+  ANONYMIZE=1               omit the checkout path and branch from this echo, for
+                            output that is going to be read off this machine
   SNAPSHOT_DIR              output directory (default runtime-snapshot/snapshots)
   SNAPSHOT_SOURCE_TEXT=0    skip capturing method source bodies
   SNAPSHOT_TRACE_COMPILE=1  also record :script_compiled events (needs a cold
@@ -42,19 +67,29 @@ APP_DIR="$(cd "$1" && pwd)"
 LABEL="$2"
 
 if [ ! -f "$APP_DIR/config/environment.rb" ]; then
-  echo "error: $APP_DIR does not look like a Rails application (no config/environment.rb)" >&2
+  if [ "$ANONYMIZE" = "1" ]; then
+    echo "error: the app directory is not a Rails application (no config/environment.rb)" >&2
+  else
+    echo "error: $APP_DIR does not look like a Rails application (no config/environment.rb)" >&2
+  fi
   exit 2
 fi
 
 mkdir -p "$SNAPSHOT_DIR"
+# Normalized once it exists, so the default's "bin/../snapshots" collapses. It is
+# echoed below and shortpath strips a repository prefix off it, neither of which
+# survives a `..` in the middle.
+SNAPSHOT_DIR="$(cd "$SNAPSHOT_DIR" && pwd)"
 OUT="$SNAPSHOT_DIR/$LABEL.json"
 
 RAILS_ENV="${RAILS_ENV:-development}"
 ENV_FILE="$APP_DIR/config/environments/$RAILS_ENV.rb"
 
 echo "=== snapshot: $LABEL ==="
-echo "  app:    $APP_DIR"
-echo "  branch: $(git -C "$APP_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '(not a git repo)')"
+if [ "$ANONYMIZE" != "1" ]; then
+  echo "  app:    $APP_DIR"
+  echo "  branch: $(git -C "$APP_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '(not a git repo)')"
+fi
 echo "  env:    $RAILS_ENV"
 
 # Read the configured value straight out of the environment file. This is a
@@ -64,6 +99,8 @@ echo "  env:    $RAILS_ENV"
 if [ -f "$ENV_FILE" ]; then
   EAGER_LINE="$(grep -E '^\s*config\.eager_load\s*=' "$ENV_FILE" | tail -1 | sed 's/^[[:space:]]*//' || true)"
   echo "  eager:  ${EAGER_LINE:-(config.eager_load not set literally in $RAILS_ENV.rb)}"
+elif [ "$ANONYMIZE" = "1" ]; then
+  echo "  eager:  (config/environments/$RAILS_ENV.rb not found)"
 else
   echo "  eager:  ($ENV_FILE not found)"
 fi
@@ -83,4 +120,4 @@ RUBYOPT="${RUBYOPT:-} -r$SCRIPT_DIR/preboot_trace.rb" \
   bin/rails runner "$SCRIPT_DIR/dump_runtime_snapshot.rb"
 
 echo
-echo "wrote $OUT"
+echo "wrote $(shortpath "$OUT")"

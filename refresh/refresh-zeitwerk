@@ -2,7 +2,7 @@
 #
 # Refresh only the Zeitwerk checkout, then all three reports.
 #
-#   local/refresh-zeitwerk [--dry-run]
+#   refresh/refresh-zeitwerk [--dry-run] [--anonymize]
 #
 # Two Rails boots instead of four -- zeitwerk-eager and zeitwerk-noeager. The
 # main-eager and main-noeager snapshots already in runtime-snapshot/snapshots/
@@ -11,10 +11,12 @@
 #
 # The two reused snapshots are listed in preflight with their age and recorded
 # eager_load, because a stale main side yields a report that reads as healthy.
-# Run local/refresh-all when the base branch has moved.
+# Run refresh/refresh-all when the base branch has moved.
 #
-# Everything here is local/refresh-all --only zeitwerk; that script holds all of
-# the logic, and this one exists so the common case has a name.
+# Everything here is refresh/refresh-all --only zeitwerk; that script holds all
+# of the logic, and this one exists so the common case has a name. Arguments and
+# the environment both pass straight through, so --anonymize and ANONYMIZE=1
+# work here exactly as they do there.
 
 set -euo pipefail
 

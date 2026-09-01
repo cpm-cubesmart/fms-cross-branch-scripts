@@ -33,7 +33,11 @@ options = {
   include_generated_ancestors: false,
   include_zeitwerk_shims: false,
   include_autoloader_shims: false,
-  max_per_section: 100
+  max_per_section: 100,
+  # Defaulted from the environment as well as the flag: bin/snapshot takes
+  # positional arguments and forwards nothing, so one exported variable is the
+  # only way to switch the whole pipeline at once.
+  anonymize: ENV["ANONYMIZE"] == "1"
 }
 
 parser = OptionParser.new do |opts|
@@ -56,6 +60,10 @@ parser = OptionParser.new do |opts|
   end
   opts.on("--max-per-section N", Integer, "cap rows per section (0 = unlimited, default 100)") do |v|
     options[:max_per_section] = v
+  end
+  opts.on("--anonymize", "omit branch, SHA and checkout paths (NOT the findings -- ",
+          "combine with --summary-only for output safe to share)") do
+    options[:anonymize] = true
   end
   opts.on("-h", "--help") { puts opts; exit 0 }
 end
@@ -143,13 +151,17 @@ class IgnoreList
   # Surfaced as warnings once the comparison has run -- a rule that quietly does
   # nothing is indistinguishable from a rule doing its job, and that is the most
   # common way triage goes wrong.
-  attr_reader :problems
+  # problem_lines is problems' line numbers on their own, for --anonymize: a
+  # malformed rule's text is quoted into the message, and the first token of a
+  # line someone wrote by hand is as likely as not a constant name.
+  attr_reader :problems, :problem_lines
 
   Rule = Struct.new(:pattern, :kind, :line, :hits)
 
   def initialize(path)
     @rules = Hash.new { |h, k| h[k] = [] }
     @problems = []
+    @problem_lines = []
 
     return unless path && File.file?(path)
 
@@ -169,11 +181,13 @@ class IgnoreList
 
       unless KINDS.include?(kind)
         @problems << "line #{i + 1}: unknown rule kind #{kind.inspect} (expected #{KINDS.join(', ')})"
+        @problem_lines << i + 1
         next
       end
 
       if pattern.empty?
         @problems << "line #{i + 1}: #{kind} rule has no pattern"
+        @problem_lines << i + 1
         next
       end
 
@@ -245,6 +259,13 @@ class IgnoreList
 end
 
 IGNORE = IgnoreList.new(options[:ignore])
+
+# Redacts the identity of the machine and the checkouts -- branch, SHA, absolute
+# paths -- and NOTHING ELSE. The findings are the report; a constant name is what
+# a row is for, and suppressing it would leave nothing behind. Output that is safe
+# to hand to someone who should not see the application is --anonymize together
+# with --summary-only, which prints no rows at all.
+ANONYMIZE = options[:anonymize]
 
 # ---------------------------------------------------------------------------
 # Canonicalization of a whole snapshot
@@ -1057,20 +1078,43 @@ if OLD_TO_NEW.empty?
               "removed-and-added throughout"
 end
 
+# The three warnings below are the only ones carrying strings derived from the
+# application -- ambiguous renames are app file paths, and an ignore rule is a
+# glob someone wrote over app constant names. Everything else warned about here
+# is an env name, a snapshot label, a version number or a Rails config path, none
+# of which say anything about the application. A new warning belongs on one side
+# of that line or the other; check which before adding one.
 unless AMBIGUOUS_RENAMES.empty?
-  warnings << "#{AMBIGUOUS_RENAMES.size} path(s) are both an old and a new name in the " \
-              "rename map and were left uncanonicalized: #{AMBIGUOUS_RENAMES.to_a.sort.join(', ')}"
+  warnings << if ANONYMIZE
+                "#{AMBIGUOUS_RENAMES.size} path(s) are both an old and a new name in " \
+                "the rename map and were left uncanonicalized"
+              else
+                "#{AMBIGUOUS_RENAMES.size} path(s) are both an old and a new name in the " \
+                "rename map and were left uncanonicalized: #{AMBIGUOUS_RENAMES.to_a.sort.join(', ')}"
+              end
 end
 
 # Every IGNORE predicate has run by now -- section? last, in semantic_total just
 # above -- so the hit counts are final.
-IGNORE.problems.each { |p| warnings << "ignore list: #{p}" }
+if ANONYMIZE
+  lines = IGNORE.problem_lines
+
+  unless lines.empty?
+    warnings << "ignore list: #{lines.length} malformed rule(s) at line(s) #{lines.join(', ')}"
+  end
+else
+  IGNORE.problems.each { |p| warnings << "ignore list: #{p}" }
+end
 
 unused_rules = IGNORE.unused
 
 unless unused_rules.empty?
-  warnings << "ignore list: #{unused_rules.length} rule(s) matched nothing: " \
-              "#{unused_rules.join(', ')}"
+  warnings << if ANONYMIZE
+                "ignore list: #{unused_rules.length} rule(s) matched nothing"
+              else
+                "ignore list: #{unused_rules.length} rule(s) matched nothing: " \
+                "#{unused_rules.join(', ')}"
+              end
 end
 
 # ---------------------------------------------------------------------------
@@ -1142,8 +1186,17 @@ def section(id, title, rows, note: nil)
 end
 
 puts "# Runtime snapshot diff"
-puts "  A (base):     #{label_a}   #{id_a['branch'] || '?'} @ #{(id_a['sha'] || '?')[0, 10]}"
-puts "  B (zeitwerk): #{label_b}   #{id_b['branch'] || '?'} @ #{(id_b['sha'] || '?')[0, 10]}"
+# The labels stay under --anonymize. They are chosen by whoever took the
+# snapshots ("main-eager"), say nothing about the application, and without them
+# there is no way to tell the two sides of the report apart.
+def checkout_suffix(id)
+  return "" if ANONYMIZE
+
+  "   #{id['branch'] || '?'} @ #{(id['sha'] || '?')[0, 10]}"
+end
+
+puts "  A (base):     #{label_a}#{checkout_suffix(id_a)}"
+puts "  B (zeitwerk): #{label_b}#{checkout_suffix(id_b)}"
 puts "  mode:         #{id_a['rails_env']}, eager_load=#{id_a['eager_load'].inspect}"
 puts
 
