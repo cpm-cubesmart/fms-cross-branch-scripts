@@ -26,6 +26,9 @@ For what the tool is and how it works internally, see the repository
 13. [Output files](#13-output-files)
 14. [Finding re-entrant loads](#14-finding-re-entrant-loads)
 
+Companion: **[DATA-DICTIONARY.md](DATA-DICTIONARY.md)** — every field a snapshot
+captures, where it comes from, and which report section reads it.
+
 ---
 
 ## 1. Before you start
@@ -672,7 +675,7 @@ All under `runtime-snapshot/snapshots/` (gitignored).
 
 | File | Contents |
 | --- | --- |
-| `<label>.json` | The snapshot. Top-level keys: `meta`, `identity`, `paths`, `load_order`, `autoload_registry`, `counts`, `skipped`, `duplicate_names`, `ancestor_methods`, `constants`. Each constant carries `ancestors`, `values` (simple constant values, digested), `class_attributes`, and `methods`. |
+| `<label>.json` | The snapshot — the only thing the reports read. Ten top-level keys, of which `constants` is the inventory and `load_order` is what happened in what order. Every field, where it comes from and what reads it: [DATA-DICTIONARY.md](DATA-DICTIONARY.md). |
 | `<label>.sources.json` | Method bodies keyed by SHA-256. Nothing in the report reads these — they are there so you can pull up a body by hand when a `~` row is surprising. Only methods defined under `Rails.root`. |
 | `renames.json` | The old → new path map, plus the raw `git diff` records. |
 | `ignore.txt` | Your triage allowlist. Not created automatically. |
